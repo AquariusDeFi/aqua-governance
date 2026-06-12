@@ -7,7 +7,6 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from aqua_governance.governance.models import HistoryProposal, LogVote, Proposal, ProposalQueueSlot
-from aqua_governance.governance.parser import generate_vote_key_by_raw_data
 from aqua_governance.governance.proposal_queue import get_queue_week_start
 from aqua_governance.governance.tasks import task_sync_proposal_statuses_by_time, task_update_proposal_results
 from aqua_governance.governance.tests._factories import (
@@ -23,6 +22,10 @@ FIXED_NOW = datetime(2024, 1, 10, 12, 0, tzinfo=datetime_timezone.utc)
 
 def _iso_z(value):
     return value.isoformat().replace('+00:00', 'Z')
+
+
+def _expected_vote_key(*, proposal_id, vote_choice, account_issuer, asset_code, time_list):
+    return f"{proposal_id}|{vote_choice}|{account_issuer}|{asset_code}|{sorted(time_list)}"
 
 
 class FakeHorizonRequestBuilder:
@@ -98,13 +101,13 @@ class FullVotingLifecycleTests(TestCase):
         end_at = start_at + timedelta(days=7, seconds=-1)
         return start_at, end_at
 
-    def _claimable_balance(self, *, balance_id, amount, asset, vote_destination, voter_account, unlock_at):
+    def _claimable_balance(self, *, balance_id, amount, asset, vote_destination, voter_account, unlock_at, sponsor=None):
         return {
             'id': balance_id,
             'paging_token': balance_id,
             'asset': asset,
             'amount': amount,
-            'sponsor': voter_account,
+            'sponsor': sponsor or voter_account,
             'last_modified_time': _iso_z(unlock_at - timedelta(hours=1)),
             'claimants': [
                 {
@@ -240,38 +243,33 @@ class FullVotingLifecycleTests(TestCase):
         self.assertTrue(ProposalQueueSlot.objects.filter(proposal=proposal, start_at=slot_start, end_at=slot_end).exists())
 
         unlock_at = proposal.end_at + timedelta(hours=1)
-        for_balance_id = '1' * 72
-        for_balance_id_secondary = '3' * 72
+        for_balance_id = '3' * 72
+        for_balance_id_secondary = '1' * 72
         against_balance_id = '2' * 72
         for_created_at = proposal.start_at + timedelta(hours=2)
         for_created_at_secondary = proposal.start_at + timedelta(hours=4)
         against_created_at = proposal.start_at + timedelta(hours=3)
-        expected_for_key = generate_vote_key_by_raw_data(
-            proposal.id,
-            LogVote.VOTE_FOR,
-            SECONDARY_ACCOUNT,
-            settings.GOVERNANCE_ICE_ASSET_CODE,
-            [_iso_z(unlock_at)],
+        service_sponsor = DEFAULT_PROPOSED_BY
+        self.assertNotEqual(service_sponsor, SECONDARY_ACCOUNT)
+        self.assertNotEqual(service_sponsor, TERTIARY_ACCOUNT)
+        expected_for_key = _expected_vote_key(
+            proposal_id=proposal.id,
+            vote_choice=LogVote.VOTE_FOR,
+            account_issuer=SECONDARY_ACCOUNT,
+            asset_code=settings.GOVERNANCE_ICE_ASSET_CODE,
+            time_list=[_iso_z(unlock_at)],
         )
-        expected_against_key = generate_vote_key_by_raw_data(
-            proposal.id,
-            LogVote.VOTE_AGAINST,
-            TERTIARY_ACCOUNT,
-            settings.GDICE_ASSET_CODE,
-            [_iso_z(unlock_at)],
+        expected_against_key = _expected_vote_key(
+            proposal_id=proposal.id,
+            vote_choice=LogVote.VOTE_AGAINST,
+            account_issuer=TERTIARY_ACCOUNT,
+            asset_code=settings.GDICE_ASSET_CODE,
+            time_list=[_iso_z(unlock_at)],
         )
 
         fake_server = FakeHorizonServer(
             claimable_balances_by_claimant={
                 proposal.vote_for_issuer: [
-                    self._claimable_balance(
-                        balance_id=for_balance_id,
-                        amount='1000.0000000',
-                        asset=f'{settings.GOVERNANCE_ICE_ASSET_CODE}:{settings.GOVERNANCE_ICE_ASSET_ISSUER}',
-                        vote_destination=proposal.vote_for_issuer,
-                        voter_account=SECONDARY_ACCOUNT,
-                        unlock_at=unlock_at,
-                    ),
                     self._claimable_balance(
                         balance_id=for_balance_id_secondary,
                         amount='200.0000000',
@@ -279,6 +277,16 @@ class FullVotingLifecycleTests(TestCase):
                         vote_destination=proposal.vote_for_issuer,
                         voter_account=SECONDARY_ACCOUNT,
                         unlock_at=unlock_at,
+                        sponsor=service_sponsor,
+                    ),
+                    self._claimable_balance(
+                        balance_id=for_balance_id,
+                        amount='1000.0000000',
+                        asset=f'{settings.GOVERNANCE_ICE_ASSET_CODE}:{settings.GOVERNANCE_ICE_ASSET_ISSUER}',
+                        vote_destination=proposal.vote_for_issuer,
+                        voter_account=SECONDARY_ACCOUNT,
+                        unlock_at=unlock_at,
+                        sponsor=service_sponsor,
                     ),
                 ],
                 proposal.vote_against_issuer: [
@@ -289,6 +297,7 @@ class FullVotingLifecycleTests(TestCase):
                         vote_destination=proposal.vote_against_issuer,
                         voter_account=TERTIARY_ACCOUNT,
                         unlock_at=unlock_at,
+                        sponsor=service_sponsor,
                     ),
                 ],
                 proposal.abstain_issuer: [],
