@@ -1,8 +1,8 @@
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.conf import settings
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -11,9 +11,11 @@ from django.utils import timezone
 from django_quill.quill import Quill
 
 from aqua_governance.governance.admin import ProposalAdmin
-from aqua_governance.governance.models import Proposal
+from aqua_governance.governance.models import Proposal, ProposalQueueSlot
+from aqua_governance.governance.proposal_queue import get_queue_week_start
 from aqua_governance.governance.tests._factories import (
     DEFAULT_PROPOSED_BY,
+    SECONDARY_ACCOUNT,
     make_asset_proposal,
     make_asset_proposal_raw,
     patch_ice_circulating_supply,
@@ -58,6 +60,11 @@ class ProposalAdminPermissionTests(TestCase):
             'date': value.strftime('%Y-%m-%d'),
             'time': value.strftime('%H:%M:%S'),
         }
+
+    def _queue_slot(self, *, weeks_ahead=1):
+        start_at = get_queue_week_start(timezone.now()) + timedelta(weeks=weeks_ahead)
+        end_at = start_at + timedelta(days=7, seconds=-1)
+        return start_at, end_at
 
     def test_manager_queryset_is_limited_to_asset_proposals(self):
         general_proposal = self._make_proposal(Proposal.PROPOSAL_TYPE_GENERAL)
@@ -155,6 +162,42 @@ class ProposalAdminPermissionTests(TestCase):
 
     @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
     def test_manager_can_create_active_asset_proposal_when_none_is_active(self, mock_lock):
+        start_at, end_at = self._queue_slot(weeks_ahead=0)
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
+
+        form_class = self.admin.get_form(request)
+        form = form_class(data={
+            'proposed_by': 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+            'title': 'Asset proposal',
+            'text': self._quill_form_value(),
+            'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            'proposal_status': Proposal.VOTING,
+            'start_at_0': self._split_datetime_form_value(start_at)['date'],
+            'start_at_1': self._split_datetime_form_value(start_at)['time'],
+            'end_at_0': self._split_datetime_form_value(end_at)['date'],
+            'end_at_1': self._split_datetime_form_value(end_at)['time'],
+            'discord_username': 'manager',
+            'asset_code': 'AQUA',
+            'asset_issuer': 'GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA',
+            'asset_issuer_information': 'info',
+            'asset_token_description': 'desc',
+            'asset_holder_distribution': 'distribution',
+            'asset_liquidity': 'liquidity',
+            'asset_trading_volume': 'volume',
+            'asset_audit_info': 'audit',
+            'asset_stellar_flags': 'flags',
+            'asset_related_projects': 'projects',
+            'asset_community_references': 'references',
+            'asset_aquarius_traction': 'traction',
+            'asset_issuer_commitments': 'commitments',
+        })
+
+        self.assertTrue(form.is_valid(), form.errors)
+        mock_lock.assert_called_once_with()
+
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_manager_cannot_create_voting_asset_proposal_with_non_weekly_slot(self, mock_lock):
         now = timezone.now()
         request = self.factory.post('/admin/')
         request.user = self._create_user(with_manage_perm=True)
@@ -186,14 +229,356 @@ class ProposalAdminPermissionTests(TestCase):
             'asset_issuer_commitments': 'commitments',
         })
 
+        self.assertFalse(form.is_valid())
+        self.assertIn('start_at', form.errors)
+        mock_lock.assert_called_once_with()
+
+    def test_admin_quorum_display_requires_positive_ice_supply(self):
+        proposal = SimpleNamespace(
+            vote_for_result=100,
+            vote_against_result=0,
+            vote_abstain_result=0,
+            ice_circulating_supply=0,
+            percent_for_quorum=10,
+        )
+
+        self.assertEqual(self.admin._list_display_quorum(proposal), 'Not enough votes')
+
+    @patch('aqua_governance.governance.models.requests.get')
+    def test_admin_save_model_creates_queue_slot_for_manual_queued_asset_proposal(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {'ice_supply_amount': 0}
+        start_at, end_at = self._queue_slot(weeks_ahead=1)
+        proposal = Proposal(
+            proposed_by=DEFAULT_PROPOSED_BY,
+            title='Manual queued asset proposal',
+            text=Quill(json.dumps({'delta': '', 'html': '<p>Test</p>'})),
+            proposal_type=Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            proposal_status=Proposal.QUEUED,
+            payment_status=Proposal.FINE,
+            draft=False,
+            action=Proposal.NONE,
+            start_at=start_at,
+            end_at=end_at,
+            asset_code='AQUA',
+            asset_issuer='GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA',
+            asset_issuer_information='info',
+            asset_token_description='desc',
+            asset_holder_distribution='distribution',
+            asset_liquidity='liquidity',
+            asset_trading_volume='volume',
+            asset_audit_info='audit',
+            asset_stellar_flags='flags',
+            asset_related_projects='projects',
+            asset_community_references='references',
+            asset_aquarius_traction='traction',
+            asset_issuer_commitments='commitments',
+        )
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(is_superuser=True)
+
+        self.admin.save_model(request, proposal, form=None, change=False)
+
+        proposal.refresh_from_db()
+        self.assertTrue(
+            ProposalQueueSlot.objects.filter(
+                proposal=proposal,
+                start_at=start_at,
+                end_at=end_at,
+            ).exists()
+        )
+
+    @patch('aqua_governance.governance.models.requests.get')
+    def test_admin_save_model_removes_queue_slot_when_proposal_leaves_queue_statuses(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {'ice_supply_amount': 0}
+        start_at, end_at = self._queue_slot(weeks_ahead=1)
+        proposal = make_asset_proposal(
+            proposal_status=Proposal.QUEUED,
+            start_at=start_at,
+            end_at=end_at,
+            title='Queued asset proposal',
+        )
+        ProposalQueueSlot.objects.create(proposal=proposal, start_at=start_at, end_at=end_at)
+        proposal.proposal_status = Proposal.VOTED
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(is_superuser=True)
+
+        self.admin.save_model(request, proposal, form=None, change=True)
+
+        self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
+
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_manager_transition_to_discussion_clears_reserved_window_and_slot(self, mock_lock):
+        start_at, end_at = self._queue_slot(weeks_ahead=1)
+        proposal = make_asset_proposal(
+            proposal_status=Proposal.QUEUED,
+            start_at=start_at,
+            end_at=end_at,
+            title='Queued asset proposal',
+        )
+        ProposalQueueSlot.objects.create(proposal=proposal, start_at=start_at, end_at=end_at)
+
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
+        form_class = self.admin.get_form(request, obj=proposal, change=True)
+        form = form_class(
+            instance=proposal,
+            data={
+                'proposed_by': proposal.proposed_by,
+                'title': proposal.title,
+                'text': self._quill_form_value(),
+                'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+                'proposal_status': Proposal.DISCUSSION,
+                'start_at_0': self._split_datetime_form_value(start_at)['date'],
+                'start_at_1': self._split_datetime_form_value(start_at)['time'],
+                'end_at_0': self._split_datetime_form_value(end_at)['date'],
+                'end_at_1': self._split_datetime_form_value(end_at)['time'],
+                'discord_username': 'manager',
+                'asset_issuer_information': 'info',
+                'asset_token_description': 'desc',
+                'asset_holder_distribution': 'distribution',
+                'asset_liquidity': 'liquidity',
+                'asset_trading_volume': 'volume',
+                'asset_audit_info': 'audit',
+                'asset_stellar_flags': 'flags',
+                'asset_related_projects': 'projects',
+                'asset_community_references': 'references',
+                'asset_aquarius_traction': 'traction',
+                'asset_issuer_commitments': 'commitments',
+            },
+        )
+
         self.assertTrue(form.is_valid(), form.errors)
+
+        updated_proposal = form.save(commit=False)
+        self.admin.save_model(request, updated_proposal, form=form, change=True)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.proposal_status, Proposal.DISCUSSION)
+        self.assertIsNone(proposal.start_at)
+        self.assertIsNone(proposal.end_at)
+        self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
         mock_lock.assert_called_once_with()
 
     @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
-    def test_manager_can_queue_asset_proposal_when_one_is_active(self, mock_lock):
-        active_proposal = self._make_proposal(Proposal.PROPOSAL_TYPE_ADD_ASSET)
-        active_proposal.proposal_status = Proposal.VOTING
-        active_proposal.save(update_fields=['proposal_status'])
+    def test_manager_can_edit_legacy_queued_or_voting_asset_without_weekly_revalidation(self, mock_lock):
+        now = timezone.now().replace(microsecond=0)
+        scenarios = [
+            {
+                'status': Proposal.QUEUED,
+                'start_at': now + timedelta(days=2),
+                'end_at': now + timedelta(days=9),
+                'title': 'Legacy queued asset proposal',
+                'updated_title': 'Legacy queued asset proposal edited',
+            },
+            {
+                'status': Proposal.VOTING,
+                'start_at': now - timedelta(days=2),
+                'end_at': now + timedelta(days=5),
+                'title': 'Legacy voting asset proposal',
+                'updated_title': 'Legacy voting asset proposal edited',
+            },
+        ]
+
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
+
+        for scenario in scenarios:
+            with self.subTest(status=scenario['status']):
+                ProposalQueueSlot.objects.all().delete()
+                Proposal.objects.all().delete()
+                proposal = make_asset_proposal(
+                    proposal_status=scenario['status'],
+                    start_at=scenario['start_at'],
+                    end_at=scenario['end_at'],
+                    title=scenario['title'],
+                )
+                ProposalQueueSlot.objects.filter(proposal=proposal).delete()
+
+                form_class = self.admin.get_form(request, obj=proposal, change=True)
+                form = form_class(
+                    instance=proposal,
+                    data={
+                        'proposed_by': proposal.proposed_by,
+                        'title': scenario['updated_title'],
+                        'text': self._quill_form_value(),
+                        'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+                        'proposal_status': scenario['status'],
+                        'start_at_0': self._split_datetime_form_value(scenario['start_at'])['date'],
+                        'start_at_1': self._split_datetime_form_value(scenario['start_at'])['time'],
+                        'end_at_0': self._split_datetime_form_value(scenario['end_at'])['date'],
+                        'end_at_1': self._split_datetime_form_value(scenario['end_at'])['time'],
+                        'discord_username': 'manager',
+                        'asset_issuer_information': 'info',
+                        'asset_token_description': 'desc',
+                        'asset_holder_distribution': 'distribution',
+                        'asset_liquidity': 'liquidity',
+                        'asset_trading_volume': 'volume',
+                        'asset_audit_info': 'audit',
+                        'asset_stellar_flags': 'flags',
+                        'asset_related_projects': 'projects',
+                        'asset_community_references': 'references',
+                        'asset_aquarius_traction': 'traction',
+                        'asset_issuer_commitments': 'commitments',
+                    },
+                )
+
+                self.assertTrue(form.is_valid(), form.errors)
+
+                updated_proposal = form.save(commit=False)
+                self.admin.save_model(request, updated_proposal, form=form, change=True)
+
+                proposal.refresh_from_db()
+                self.assertEqual(proposal.title, scenario['updated_title'])
+                self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
+
+        mock_lock.assert_not_called()
+
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_manager_title_only_edit_on_slotless_weekly_legacy_asset_does_not_create_slot(self, mock_lock):
+        current_week_start = get_queue_week_start(timezone.now())
+        scenarios = [
+            {
+                'status': Proposal.QUEUED,
+                'start_at': current_week_start + timedelta(weeks=1),
+            },
+            {
+                'status': Proposal.VOTING,
+                'start_at': current_week_start,
+            },
+        ]
+
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
+
+        for scenario in scenarios:
+            with self.subTest(status=scenario['status']):
+                ProposalQueueSlot.objects.all().delete()
+                Proposal.objects.all().delete()
+                start_at = scenario['start_at']
+                end_at = start_at + timedelta(days=7, seconds=-1)
+                proposal = make_asset_proposal(
+                    proposal_status=scenario['status'],
+                    start_at=start_at,
+                    end_at=end_at,
+                    title=f'Legacy {scenario["status"].lower()} weekly proposal',
+                )
+                ProposalQueueSlot.objects.filter(proposal=proposal).delete()
+
+                form_class = self.admin.get_form(request, obj=proposal, change=True)
+                form = form_class(
+                    instance=proposal,
+                    data={
+                        'proposed_by': proposal.proposed_by,
+                        'title': f'{proposal.title} edited',
+                        'text': self._quill_form_value(),
+                        'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+                        'proposal_status': scenario['status'],
+                        'start_at_0': self._split_datetime_form_value(start_at)['date'],
+                        'start_at_1': self._split_datetime_form_value(start_at)['time'],
+                        'end_at_0': self._split_datetime_form_value(end_at)['date'],
+                        'end_at_1': self._split_datetime_form_value(end_at)['time'],
+                        'discord_username': 'manager',
+                        'asset_issuer_information': 'info',
+                        'asset_token_description': 'desc',
+                        'asset_holder_distribution': 'distribution',
+                        'asset_liquidity': 'liquidity',
+                        'asset_trading_volume': 'volume',
+                        'asset_audit_info': 'audit',
+                        'asset_stellar_flags': 'flags',
+                        'asset_related_projects': 'projects',
+                        'asset_community_references': 'references',
+                        'asset_aquarius_traction': 'traction',
+                        'asset_issuer_commitments': 'commitments',
+                    },
+                )
+
+                self.assertTrue(form.is_valid(), form.errors)
+
+                updated_proposal = form.save(commit=False)
+                self.admin.save_model(request, updated_proposal, form=form, change=True)
+
+                proposal.refresh_from_db()
+                self.assertEqual(proposal.title, f'Legacy {scenario["status"].lower()} weekly proposal edited')
+                self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
+
+        mock_lock.assert_not_called()
+
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_manager_schedule_change_on_slotless_weekly_asset_creates_validated_slot(self, mock_lock):
+        old_start_at, old_end_at = self._queue_slot(weeks_ahead=1)
+        new_start_at, new_end_at = self._queue_slot(weeks_ahead=2)
+        proposal = make_asset_proposal(
+            proposal_status=Proposal.QUEUED,
+            start_at=old_start_at,
+            end_at=old_end_at,
+            title='Legacy queued asset proposal',
+        )
+        ProposalQueueSlot.objects.filter(proposal=proposal).delete()
+
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
+        form_class = self.admin.get_form(request, obj=proposal, change=True)
+        form = form_class(
+            instance=proposal,
+            data={
+                'proposed_by': proposal.proposed_by,
+                'title': 'Legacy queued asset proposal moved',
+                'text': self._quill_form_value(),
+                'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+                'proposal_status': Proposal.QUEUED,
+                'start_at_0': self._split_datetime_form_value(new_start_at)['date'],
+                'start_at_1': self._split_datetime_form_value(new_start_at)['time'],
+                'end_at_0': self._split_datetime_form_value(new_end_at)['date'],
+                'end_at_1': self._split_datetime_form_value(new_end_at)['time'],
+                'discord_username': 'manager',
+                'asset_issuer_information': 'info',
+                'asset_token_description': 'desc',
+                'asset_holder_distribution': 'distribution',
+                'asset_liquidity': 'liquidity',
+                'asset_trading_volume': 'volume',
+                'asset_audit_info': 'audit',
+                'asset_stellar_flags': 'flags',
+                'asset_related_projects': 'projects',
+                'asset_community_references': 'references',
+                'asset_aquarius_traction': 'traction',
+                'asset_issuer_commitments': 'commitments',
+            },
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+
+        updated_proposal = form.save(commit=False)
+        self.admin.save_model(request, updated_proposal, form=form, change=True)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.start_at, new_start_at)
+        self.assertEqual(proposal.end_at, new_end_at)
+        self.assertTrue(
+            ProposalQueueSlot.objects.filter(
+                proposal=proposal,
+                start_at=new_start_at,
+                end_at=new_end_at,
+            ).exists()
+        )
+        mock_lock.assert_called_once_with()
+
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_manager_can_queue_different_asset_proposal_when_same_asset_is_active(self, mock_lock):
+        active_start_at, active_end_at = self._queue_slot(weeks_ahead=0)
+        queued_start_at, queued_end_at = self._queue_slot(weeks_ahead=1)
+        active_proposal = make_asset_proposal(
+            proposal_status=Proposal.VOTING,
+            start_at=active_start_at,
+            end_at=active_end_at,
+            title='Active AQUA asset proposal',
+        )
+        ProposalQueueSlot.objects.create(
+            proposal=active_proposal,
+            start_at=active_start_at,
+            end_at=active_end_at,
+        )
         request = self.factory.post('/admin/')
         request.user = self._create_user(with_manage_perm=True)
 
@@ -203,9 +588,14 @@ class ProposalAdminPermissionTests(TestCase):
             'title': 'Asset proposal',
             'text': self._quill_form_value(),
             'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            'proposal_status': Proposal.QUEUED,
+            'start_at_0': self._split_datetime_form_value(queued_start_at)['date'],
+            'start_at_1': self._split_datetime_form_value(queued_start_at)['time'],
+            'end_at_0': self._split_datetime_form_value(queued_end_at)['date'],
+            'end_at_1': self._split_datetime_form_value(queued_end_at)['time'],
             'discord_username': 'manager',
-            'asset_code': 'AQUA',
-            'asset_issuer': 'GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA',
+            'asset_code': 'USDC',
+            'asset_issuer': SECONDARY_ACCOUNT,
             'asset_issuer_information': 'info',
             'asset_token_description': 'desc',
             'asset_holder_distribution': 'distribution',
@@ -222,34 +612,93 @@ class ProposalAdminPermissionTests(TestCase):
         self.assertTrue(form.is_valid(), form.errors)
         mock_lock.assert_called_once_with()
 
-    def test_manager_asset_queue_prefill_uses_general_voting_proposal(self):
-        now = timezone.now()
-        blocker = self._make_proposal(Proposal.PROPOSAL_TYPE_GENERAL)
-        blocker.proposal_status = Proposal.VOTING
-        blocker.start_at = now
-        blocker.end_at = now + timedelta(days=10)
-        blocker.save(update_fields=['proposal_status', 'start_at', 'end_at'])
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_manager_cannot_keep_queued_asset_when_same_asset_queued_or_voting_blocker_exists(self, mock_lock):
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
 
+        for blocker_status, blocker_weeks_ahead in (
+            (Proposal.QUEUED, 1),
+            (Proposal.VOTING, 0),
+        ):
+            with self.subTest(blocker_status=blocker_status):
+                ProposalQueueSlot.objects.all().delete()
+                Proposal.objects.all().delete()
+
+                blocker_start_at, blocker_end_at = self._queue_slot(weeks_ahead=blocker_weeks_ahead)
+                blocker = make_asset_proposal(
+                    proposal_status=blocker_status,
+                    start_at=blocker_start_at,
+                    end_at=blocker_end_at,
+                    title=f'Blocking {blocker_status.lower()} asset proposal',
+                )
+                ProposalQueueSlot.objects.create(
+                    proposal=blocker,
+                    start_at=blocker_start_at,
+                    end_at=blocker_end_at,
+                )
+
+                editable_start_at, editable_end_at = self._queue_slot(weeks_ahead=2)
+                editable = make_asset_proposal(
+                    proposal_status=Proposal.QUEUED,
+                    start_at=editable_start_at,
+                    end_at=editable_end_at,
+                    title='Editable queued asset proposal',
+                )
+
+                form_class = self.admin.get_form(request, obj=editable, change=True)
+                form = form_class(
+                    instance=editable,
+                    data={
+                        'proposed_by': editable.proposed_by,
+                        'title': 'Editable queued asset proposal updated',
+                        'text': self._quill_form_value(),
+                        'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+                        'proposal_status': Proposal.QUEUED,
+                        'start_at_0': self._split_datetime_form_value(editable_start_at)['date'],
+                        'start_at_1': self._split_datetime_form_value(editable_start_at)['time'],
+                        'end_at_0': self._split_datetime_form_value(editable_end_at)['date'],
+                        'end_at_1': self._split_datetime_form_value(editable_end_at)['time'],
+                        'discord_username': 'manager',
+                        'asset_issuer_information': 'info',
+                        'asset_token_description': 'desc',
+                        'asset_holder_distribution': 'distribution',
+                        'asset_liquidity': 'liquidity',
+                        'asset_trading_volume': 'volume',
+                        'asset_audit_info': 'audit',
+                        'asset_stellar_flags': 'flags',
+                        'asset_related_projects': 'projects',
+                        'asset_community_references': 'references',
+                        'asset_aquarius_traction': 'traction',
+                        'asset_issuer_commitments': 'commitments',
+                    },
+                )
+
+                self.assertFalse(form.is_valid())
+                self.assertIn('__all__', form.errors)
+                self.assertIn(str(blocker.id), form.errors['__all__'][0])
+
+        mock_lock.assert_not_called()
+
+    def test_manager_add_form_does_not_prefill_voting_window(self):
         request = self.factory.get('/admin/')
         request.user = self._create_user(with_manage_perm=True)
 
         form_class = self.admin.get_form(request)
         form = form_class()
 
-        expected_start_at = blocker.end_at + timedelta(seconds=settings.ASSET_QUEUE_GAP_SECONDS)
-        expected_end_at = expected_start_at + timedelta(days=settings.ASSET_MIN_VOTING_DURATION_DAYS)
-
-        self.assertEqual(form.initial['start_at'], expected_start_at)
-        self.assertEqual(form.initial['end_at'], expected_end_at)
+        self.assertNotIn('start_at', form.initial)
+        self.assertNotIn('end_at', form.initial)
 
     @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
     def test_manager_cannot_create_active_asset_proposal_with_overlapping_interval(self, mock_lock):
-        now = timezone.now()
+        start_at, end_at = self._queue_slot(weeks_ahead=0)
         active_proposal = self._make_proposal(Proposal.PROPOSAL_TYPE_ADD_ASSET)
         active_proposal.proposal_status = Proposal.VOTING
-        active_proposal.start_at = now
-        active_proposal.end_at = now + timedelta(days=10)
+        active_proposal.start_at = start_at
+        active_proposal.end_at = end_at
         active_proposal.save(update_fields=['proposal_status', 'start_at', 'end_at'])
+        ProposalQueueSlot.objects.create(proposal=active_proposal, start_at=start_at, end_at=end_at)
         request = self.factory.post('/admin/')
         request.user = self._create_user(with_manage_perm=True)
 
@@ -260,10 +709,10 @@ class ProposalAdminPermissionTests(TestCase):
             'text': self._quill_form_value(),
             'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
             'proposal_status': Proposal.VOTING,
-            'start_at_0': self._split_datetime_form_value(now + timedelta(days=9))['date'],
-            'start_at_1': self._split_datetime_form_value(now + timedelta(days=9))['time'],
-            'end_at_0': self._split_datetime_form_value(now + timedelta(days=19))['date'],
-            'end_at_1': self._split_datetime_form_value(now + timedelta(days=19))['time'],
+            'start_at_0': self._split_datetime_form_value(start_at)['date'],
+            'start_at_1': self._split_datetime_form_value(start_at)['time'],
+            'end_at_0': self._split_datetime_form_value(end_at)['date'],
+            'end_at_1': self._split_datetime_form_value(end_at)['time'],
             'discord_username': 'manager',
             'asset_code': 'AQUA',
             'asset_issuer': 'GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA',
@@ -287,12 +736,13 @@ class ProposalAdminPermissionTests(TestCase):
 
     @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
     def test_manager_cannot_create_active_asset_proposal_with_overlapping_general_interval(self, mock_lock):
-        now = timezone.now()
+        start_at, end_at = self._queue_slot(weeks_ahead=0)
         active_proposal = self._make_proposal(Proposal.PROPOSAL_TYPE_GENERAL)
         active_proposal.proposal_status = Proposal.VOTING
-        active_proposal.start_at = now
-        active_proposal.end_at = now + timedelta(days=10)
+        active_proposal.start_at = start_at
+        active_proposal.end_at = end_at
         active_proposal.save(update_fields=['proposal_status', 'start_at', 'end_at'])
+        ProposalQueueSlot.objects.create(proposal=active_proposal, start_at=start_at, end_at=end_at)
         request = self.factory.post('/admin/')
         request.user = self._create_user(with_manage_perm=True)
 
@@ -303,10 +753,10 @@ class ProposalAdminPermissionTests(TestCase):
             'text': self._quill_form_value(),
             'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
             'proposal_status': Proposal.VOTING,
-            'start_at_0': self._split_datetime_form_value(now + timedelta(days=9))['date'],
-            'start_at_1': self._split_datetime_form_value(now + timedelta(days=9))['time'],
-            'end_at_0': self._split_datetime_form_value(now + timedelta(days=19))['date'],
-            'end_at_1': self._split_datetime_form_value(now + timedelta(days=19))['time'],
+            'start_at_0': self._split_datetime_form_value(start_at)['date'],
+            'start_at_1': self._split_datetime_form_value(start_at)['time'],
+            'end_at_0': self._split_datetime_form_value(end_at)['date'],
+            'end_at_1': self._split_datetime_form_value(end_at)['time'],
             'discord_username': 'manager',
             'asset_code': 'AQUA',
             'asset_issuer': 'GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA',
@@ -354,6 +804,11 @@ class ProposalAdminPermissionTests(TestCase):
         active.end_at = now + timedelta(days=10)
         active.title = 'Active VOTING'
         active.save(update_fields=['proposal_status', 'start_at', 'end_at', 'title'])
+        ProposalQueueSlot.objects.create(
+            proposal=active,
+            start_at=active.start_at,
+            end_at=active.end_at,
+        )
 
         # VOTED asset proposal — the row the manager is editing.
         voted = self._make_proposal(Proposal.PROPOSAL_TYPE_ADD_ASSET)

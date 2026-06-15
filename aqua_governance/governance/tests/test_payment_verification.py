@@ -132,6 +132,7 @@ class PaymentVerificationTests(SimpleTestCase):
 
 def _proposal_stub(**overrides):
     proposal = SimpleNamespace(
+        id=1,
         TO_CREATE=Proposal.TO_CREATE,
         TO_UPDATE=Proposal.TO_UPDATE,
         TO_SUBMIT=Proposal.TO_SUBMIT,
@@ -140,12 +141,15 @@ def _proposal_stub(**overrides):
         HORIZON_ERROR=Proposal.HORIZON_ERROR,
         action=Proposal.TO_CREATE,
         status=Proposal.DISCUSSION,
+        proposal_status=Proposal.DISCUSSION,
         payment_status=None,
         draft=True,
         hide=False,
         is_asset_proposal=False,
         transaction_hash='a' * 64,
         new_transaction_hash='b' * 64,
+        new_start_at=None,
+        new_end_at=None,
         text=_quill_text('<p>Current payment text</p>'),
         new_text=_quill_text('<p>Updated payment text</p>'),
         save=Mock(),

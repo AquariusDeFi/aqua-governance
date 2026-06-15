@@ -66,6 +66,9 @@ class ProposalStatusFilterBackend(BaseFilterBackend):
         if status_value == 'expired':
             return queryset.filter(proposal_status=Proposal.EXPIRED)
 
+        if status_value == 'queued':
+            return queryset.filter(proposal_status=Proposal.QUEUED)
+
         return queryset
 
 

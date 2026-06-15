@@ -1,13 +1,14 @@
 from datetime import datetime, timezone as dt_timezone
 
 from django.conf import settings
-from django.db.models import Exists, F, OuterRef, Prefetch
+from django.db.models import Exists, F, OuterRef, Prefetch, Q
 from django.http import Http404
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.generics import get_object_or_404
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from rest_framework import status
 
 from rest_framework.filters import OrderingFilter
 from rest_framework.mixins import CreateModelMixin, ListModelMixin, RetrieveModelMixin, UpdateModelMixin
@@ -15,6 +16,8 @@ from rest_framework.permissions import AllowAny
 from rest_framework.viewsets import GenericViewSet
 from stellar_sdk import TransactionEnvelope
 
+from aqua_governance.governance import proposal_transactions
+from aqua_governance.governance.exceptions import build_asset_proposal_conflict_detail
 from aqua_governance.governance.filters import (
     ProposalStatusFilterBackend,
     ProposalOwnerFilterBackend,
@@ -25,7 +28,9 @@ from aqua_governance.governance.filters import (
     build_logvote_prefetch,
     is_active_vote_query,
 )
-from aqua_governance.governance.models import AssetToken, LogVote, Proposal, HistoryProposal
+from aqua_governance.governance.models import AssetToken, LogVote, Proposal, HistoryProposal, ProposalQueueSlot
+from aqua_governance.governance.proposal_queue import get_max_booking_datetime
+from aqua_governance.governance.proposal_queue_slots import true_queue_slot_occupancy_q
 from aqua_governance.governance.pagination import CustomPageNumberPagination
 from aqua_governance.governance.serializers import (
     LogVoteSerializer,
@@ -133,9 +138,9 @@ class ProposalViewSet(
             queryset = queryset.exclude(proposal_status=Proposal.EXPIRED)
 
         if self.action == "submit_proposal":
-            queryset = queryset.filter(
-                proposal_status=Proposal.DISCUSSION,
-                last_updated_at__lte=timezone.now() - settings.DISCUSSION_TIME,
+            queryset = queryset.filter(proposal_status=Proposal.DISCUSSION).filter(
+                Q(action=Proposal.TO_SUBMIT)
+                | Q(last_updated_at__lte=timezone.now() - settings.DISCUSSION_TIME),
             )
 
         if self.action == "update" or self.action == "partial_update":
@@ -195,7 +200,28 @@ class ProposalViewSet(
     @action(detail=True, methods=["post"], url_path="check_payment", url_name="check-payment")
     def check_proposal_payment(self, request, pk=None):
         proposal = self.get_object()
-        proposal.check_transaction()
+        result = proposal_transactions.check_transaction(proposal)
+        if result and result.get('outcome') == 'asset_proposal_conflict':
+            return Response(
+                data=build_asset_proposal_conflict_detail(
+                    canonical_asset_contract_address=result.get('asset_contract_address'),
+                    conflict=result.get('conflict'),
+                ),
+                status=status.HTTP_409_CONFLICT,
+            )
+        if result and result.get('outcome') == 'slot_conflict':
+            return Response(
+                data={
+                    'detail': 'The selected queue slot is already occupied by another proposal.',
+                    'code': 'proposal_queue_slot_conflict',
+                    'selected_slot': {
+                        'start_at': proposal.new_start_at,
+                        'end_at': proposal.new_end_at,
+                    },
+                    'conflict': result.get('conflict'),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         return Response(data=self.get_serializer(instance=proposal).data)
 
 
@@ -207,3 +233,28 @@ class AssetProposalViewSet(CreateModelMixin, GenericViewSet):
 
 class TestProposalViewSet(ProposalViewSet):
     queryset = Proposal.objects.filter(hide=False)
+
+
+class ProposalQueueViewSet(ListModelMixin, GenericViewSet):
+    permission_classes = (AllowAny,)
+    pagination_class = CustomPageNumberPagination
+    serializer_class = serializers_v2.ProposalQueueSlotSerializer
+    ordering = ["start_at"]
+
+    def get_queryset(self):
+        now = timezone.now()
+        return (
+            ProposalQueueSlot.objects
+            .filter(
+                true_queue_slot_occupancy_q(),
+                end_at__gte=now,
+            )
+            .select_related("proposal")
+            .order_by("start_at", "proposal_id")
+        )
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        response.data["max_booking_datetime"] = get_max_booking_datetime()
+        response.data["booking_horizon_weeks"] = settings.PROPOSAL_QUEUE_BOOKING_HORIZON_WEEKS
+        return response

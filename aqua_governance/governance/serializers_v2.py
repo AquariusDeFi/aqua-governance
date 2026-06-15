@@ -1,15 +1,19 @@
-from datetime import timedelta
-
 from django.conf import settings
 from django.db import transaction
-from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 from aqua_governance.governance.asset_payload import validate_asset_payload
-from aqua_governance.governance.asset_tokens import upsert_asset_token_from_proposal
+from aqua_governance.governance.asset_tokens import (
+    find_active_asset_proposal_conflict,
+    serialize_asset_proposal_conflict,
+    upsert_asset_token_from_proposal,
+)
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
-from aqua_governance.governance.models import AssetToken, Proposal, HistoryProposal
+from aqua_governance.governance.exceptions import AssetProposalConflictError, ASSET_PROPOSAL_CONFLICT_DETAIL
+from aqua_governance.governance.models import AssetToken, Proposal, HistoryProposal, ProposalQueueSlot
+from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
+from aqua_governance.governance.proposal_queue_slots import is_queue_slot_available
 from aqua_governance.governance.serializer_fields import QuillField
 from aqua_governance.governance.serializers import HistoryProposalSerializer, LogVoteSerializer
 from aqua_governance.utils.payments import check_transaction_xdr
@@ -96,6 +100,22 @@ def validate_asset_payload_fields(attrs):
         )
     except ValueError as exc:
         raise ValidationError(_map_asset_validation_error(str(exc))) from exc
+
+
+def _asset_proposal_conflict_validation_error(conflict) -> ValidationError:
+    return ValidationError(
+        {
+            'proposal_id': conflict.proposal.id,
+            'non_field_errors': ASSET_PROPOSAL_CONFLICT_DETAIL,
+        }
+    )
+
+
+def _raise_asset_proposal_conflict(conflict) -> None:
+    raise AssetProposalConflictError(
+        canonical_asset_contract_address=conflict.canonical_asset_contract_address,
+        conflict=serialize_asset_proposal_conflict(conflict),
+    )
 
 
 def _map_asset_validation_error(message: str):
@@ -413,6 +433,14 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
         if attrs.get("proposal_type") not in Proposal.ASSET_PROPOSAL_TYPES:
             raise ValidationError({"proposal_type": "Asset proposal type must be ADD_ASSET or REMOVE_ASSET."})
         validate_asset_payload_fields(attrs)
+        conflict = find_active_asset_proposal_conflict(
+            proposal_type=attrs["proposal_type"],
+            asset_code=attrs.get("asset_code"),
+            asset_issuer=attrs.get("asset_issuer"),
+            asset_contract_address=attrs.get("asset_contract_address"),
+        )
+        if conflict is not None:
+            raise _asset_proposal_conflict_validation_error(conflict)
         validate_no_matching_pending_create(attrs)
         return attrs
 
@@ -427,10 +455,6 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
         validated_data["payment_status"] = status
 
         with transaction.atomic():
-            acquire_proposal_transition_lock()
-            start_at, end_at = Proposal.compute_asset_queue_window()
-            validated_data["start_at"] = start_at
-            validated_data["end_at"] = end_at
             proposal = super().create(validated_data)
             upsert_asset_token_from_proposal(proposal, save=True)
 
@@ -522,6 +546,8 @@ class ProposalUpdateSerializer(serializers.ModelSerializer):  # think about join
 
 class SubmitSerializer(serializers.ModelSerializer):
     text = QuillField(required=False)
+    start_at = serializers.DateTimeField(source='new_start_at')
+    end_at = serializers.DateTimeField(source='new_end_at')
 
     class Meta:
         model = Proposal
@@ -562,8 +588,6 @@ class SubmitSerializer(serializers.ModelSerializer):
             "onchain_execution_started_at",
             "onchain_execution_submitted_at",
             "onchain_execution_poll_count",
-            "new_start_at",
-            "new_end_at",
             "new_envelope_xdr",
             "new_transaction_hash",
         ]
@@ -603,8 +627,8 @@ class SubmitSerializer(serializers.ModelSerializer):
             "onchain_execution_poll_count",
         ]
         extra_kwargs = {
-            "new_start_at": {"required": True},
-            "new_end_at": {"required": True},
+            "start_at": {"required": True},
+            "end_at": {"required": True},
             "new_envelope_xdr": {"required": True},
             "new_transaction_hash": {"required": True},
         }
@@ -612,42 +636,31 @@ class SubmitSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         new_start_at = attrs["new_start_at"]
         new_end_at = attrs["new_end_at"]
-        if new_end_at <= new_start_at:
-            raise ValidationError({"new_end_at": "new_end_at must be greater than new_start_at."})
-        if new_end_at <= timezone.now():
-            raise ValidationError({"new_end_at": "new_end_at must be in the future."})
+        validate_weekly_queue_slot(new_start_at, new_end_at)
 
-        is_asset_proposal = self.instance.is_asset_proposal
-        minimum_days = (
-            settings.ASSET_MIN_VOTING_DURATION_DAYS
-            if is_asset_proposal
-            else settings.DEFAULT_MIN_VOTING_DURATION_DAYS
-        )
-        if (new_end_at - new_start_at) < timedelta(days=minimum_days):
-            raise ValidationError(
-                {
-                    "new_end_at": f"Minimum voting duration for this proposal type is {minimum_days} days."
-                }
-            )
+        if self.instance.is_asset_proposal:
+            conflict = find_active_asset_proposal_conflict(proposal=self.instance)
+            if conflict is not None:
+                _raise_asset_proposal_conflict(conflict)
 
-        if self._has_voting_interval_conflict(new_start_at, new_end_at, self.instance.id):
-            raise self._voting_interval_conflict_error()
+        if not self._is_queue_slot_available(new_start_at, new_end_at, self.instance.id):
+            raise self._queue_slot_conflict_error()
         return attrs
 
     @staticmethod
-    def _has_voting_interval_conflict(new_start_at, new_end_at, current_proposal_id: int) -> bool:
-        return Proposal.has_voting_interval_conflict(
+    def _is_queue_slot_available(new_start_at, new_end_at, current_proposal_id: int) -> bool:
+        return is_queue_slot_available(
             start_at=new_start_at,
             end_at=new_end_at,
-            current_proposal_id=current_proposal_id,
+            exclude_proposal_id=current_proposal_id,
         )
 
     @staticmethod
-    def _voting_interval_conflict_error() -> ValidationError:
+    def _queue_slot_conflict_error() -> ValidationError:
         return ValidationError(
             {
-                "new_start_at": "Proposal voting interval overlaps with another queued or active proposal.",
-                "new_end_at": "Proposal voting interval overlaps with another queued or active proposal.",
+                "start_at": "The selected queue slot is already occupied by another proposal.",
+                "end_at": "The selected queue slot is already occupied by another proposal.",
             }
         )
 
@@ -660,12 +673,16 @@ class SubmitSerializer(serializers.ModelSerializer):
         with transaction.atomic():
             acquire_proposal_transition_lock()
             locked_instance = Proposal.objects.select_for_update().get(id=instance.id)
-            if self._has_voting_interval_conflict(
+            if locked_instance.is_asset_proposal:
+                conflict = find_active_asset_proposal_conflict(proposal=locked_instance)
+                if conflict is not None:
+                    _raise_asset_proposal_conflict(conflict)
+            if not self._is_queue_slot_available(
                 validated_data["new_start_at"],
                 validated_data["new_end_at"],
                 locked_instance.id,
             ):
-                raise self._voting_interval_conflict_error()
+                raise self._queue_slot_conflict_error()
             return super().update(locked_instance, validated_data)
 
 
@@ -691,6 +708,26 @@ class AssetTokenProposalSerializer(serializers.ModelSerializer):
             "onchain_execution_tx_hash",
             "created_at",
             "last_updated_at",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Proposal Queue serializers
+# ---------------------------------------------------------------------------
+class ProposalQueueSlotSerializer(serializers.ModelSerializer):
+    proposal = serializers.IntegerField(source='proposal_id', read_only=True)
+    proposal_title = serializers.CharField(source='proposal.title', read_only=True)
+    proposal_status = serializers.CharField(source='proposal.proposal_status', read_only=True)
+
+    class Meta:
+        model = ProposalQueueSlot
+        fields = [
+            "proposal",
+            "proposal_title",
+            "proposal_status",
+            "start_at",
+            "end_at",
+            "occupied_at",
         ]
 
 

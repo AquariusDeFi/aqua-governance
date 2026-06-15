@@ -3,9 +3,13 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
+from aqua_governance.governance.asset_tokens import find_active_asset_proposal_conflict
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
+from aqua_governance.governance.exceptions import ASSET_PROPOSAL_CONFLICT_DETAIL
 from aqua_governance.governance.models import Proposal
 from aqua_governance.governance.asset_payload import validate_asset_payload
+from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
+from aqua_governance.governance.proposal_queue_slots import is_queue_slot_available
 from aqua_governance.governance.serializers_v2 import ASSET_FIELDS, ASSET_REQUIRED_TEXT_FIELDS
 from aqua_governance.utils.payments import check_transaction_xdr
 from aqua_governance.utils.widgets import CustomQuillWidget
@@ -51,22 +55,6 @@ class ProposalAdminForm(forms.ModelForm):
         for field_name in ADMIN_OPTIONAL_FIELDS:
             if field_name in self.fields:
                 self.fields[field_name].required = False
-
-        if self.instance._state.adding:
-            self._prefill_asset_queue_window()
-
-    def _prefill_asset_queue_window(self):
-        # Prefill with the next free queue slot. Safe for any proposal_type because
-        # ProposalAdminForm.clean() forces start_at/end_at back to None for GENERAL
-        # proposals on creation, so prefilled values cannot bypass the submit-payment gate.
-        if 'start_at' not in self.fields or 'end_at' not in self.fields:
-            return
-        if self.initial.get('start_at') or self.initial.get('end_at'):
-            return
-
-        start_at, end_at = Proposal.compute_asset_queue_window()
-        self.initial['start_at'] = start_at
-        self.initial['end_at'] = end_at
 
     class Meta:
         model = Proposal
@@ -116,6 +104,30 @@ class ProposalAdminForm(forms.ModelForm):
             start_at = None
             end_at = None
 
+        if (
+            not self.instance._state.adding
+            and target_status == Proposal.DISCUSSION
+            and self.instance.proposal_status != Proposal.DISCUSSION
+            and (start_at is not None or end_at is not None)
+        ):
+            # Leaving a queued/voting-style state for DISCUSSION must also drop
+            # any reserved window so the proposal cannot retain slot-like
+            # timing metadata without an attached queue slot.
+            cleaned_data['start_at'] = None
+            cleaned_data['end_at'] = None
+            start_at = None
+            end_at = None
+
+        if (
+            self.instance._state.adding
+            and target_status == Proposal.DISCUSSION
+            and (start_at is not None or end_at is not None)
+        ):
+            raise ValidationError({
+                'start_at': 'Discussion proposals must not set a voting window before submit.',
+                'end_at': 'Discussion proposals must not set a voting window before submit.',
+            })
+
         # Detect whether start_at or end_at changed vs the persisted instance.
         if self.instance._state.adding:
             start_at_changed = start_at is not None
@@ -125,29 +137,69 @@ class ProposalAdminForm(forms.ModelForm):
             end_at_changed = 'end_at' in cleaned_data and cleaned_data['end_at'] != self.instance.end_at
 
         times_changed = start_at_changed or end_at_changed
-        is_active_status = target_status in (Proposal.DISCUSSION, Proposal.VOTING)
+        queue_relevant_status = target_status in (Proposal.QUEUED, Proposal.VOTING)
+        entering_queue_relevant_status = queue_relevant_status and (
+            self.instance._state.adding or target_status != self.instance.proposal_status
+        )
+        weekly_slot_validation_required = queue_relevant_status and (
+            times_changed or entering_queue_relevant_status
+        )
 
-        if is_active_status or times_changed:
+        if times_changed or entering_queue_relevant_status:
             acquire_proposal_transition_lock()
             interval_lock_acquired = True
-            if target_status == Proposal.VOTING and (not start_at or not end_at):
+            if target_status == Proposal.DISCUSSION and times_changed and (start_at is not None or end_at is not None):
                 raise ValidationError({
-                    'start_at': 'start_at is required for an active proposal.',
-                    'end_at': 'end_at is required for an active proposal.',
+                    'start_at': 'Discussion proposals must not set a voting window before submit.',
+                    'end_at': 'Discussion proposals must not set a voting window before submit.',
                 })
+
+            if queue_relevant_status and (not start_at or not end_at):
+                raise ValidationError({
+                    'start_at': 'start_at is required for a queued or voting proposal.',
+                    'end_at': 'end_at is required for a queued or voting proposal.',
+                })
+
             if start_at and end_at:
-                if is_active_status and end_at <= timezone.now():
-                    raise ValidationError({'end_at': 'end_at must be in the future.'})
+                now = timezone.now()
+                if weekly_slot_validation_required:
+                    validate_weekly_queue_slot(start_at, end_at, now=now)
+                if queue_relevant_status:
+                    if target_status == Proposal.QUEUED and start_at <= now:
+                        raise ValidationError({
+                            'start_at': 'Queued proposals must use a future queue slot.',
+                        })
+                    if target_status == Proposal.VOTING:
+                        if end_at <= now:
+                            raise ValidationError({'end_at': 'end_at must be in the future.'})
+                        if start_at > now:
+                            raise ValidationError({
+                                'start_at': 'Voting proposals must use the current queue slot.',
+                            })
+
                 current_proposal_id = None if self.instance._state.adding else self.instance.id
-                if Proposal.has_voting_interval_conflict(
+                if not is_queue_slot_available(
                     start_at=start_at,
                     end_at=end_at,
-                    current_proposal_id=current_proposal_id,
+                    exclude_proposal_id=current_proposal_id,
                 ):
                     raise ValidationError({
                         'start_at': 'Proposal voting interval overlaps with another queued or active proposal.',
                         'end_at': 'Proposal voting interval overlaps with another queued or active proposal.',
                     })
+
+        if is_asset_proposal and queue_relevant_status:
+            conflict = find_active_asset_proposal_conflict(
+                proposal_type=proposal_type,
+                asset_code=self._cleaned_or_instance_value(cleaned_data, 'asset_code'),
+                asset_issuer=self._cleaned_or_instance_value(cleaned_data, 'asset_issuer'),
+                asset_contract_address=self._cleaned_or_instance_value(cleaned_data, 'asset_contract_address'),
+                exclude_proposal_id=None if self.instance._state.adding else self.instance.id,
+            )
+            if conflict is not None:
+                raise ValidationError(
+                    f'{ASSET_PROPOSAL_CONFLICT_DETAIL} Conflicting proposal ID: {conflict.proposal.id}.'
+                )
 
         if self.instance._state.adding:
             if is_asset_proposal:
@@ -167,8 +219,6 @@ class ProposalAdminForm(forms.ModelForm):
                 # a paid submit step.
                 cleaned_data['start_at'] = None
                 cleaned_data['end_at'] = None
-                self.instance.start_at = None
-                self.instance.end_at = None
 
         if not is_asset_proposal and cleaned_data.get('envelope_xdr'):
             payment_status = check_transaction_xdr(cleaned_data, settings.PROPOSAL_CREATE_OR_UPDATE_COST)

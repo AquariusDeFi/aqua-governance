@@ -4,15 +4,17 @@ from typing import Optional
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F
 from django.utils import timezone
 from stellar_sdk import Server
 from stellar_sdk.soroban_rpc import GetTransactionStatus
 
+from aqua_governance.governance import proposal_transactions
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
-from aqua_governance.governance.models import AssetToken, Proposal
+from aqua_governance.governance.models import AssetToken, Proposal, ProposalQueueSlot
 from aqua_governance.governance.onchain_hooks import execute_onchain_action
 from aqua_governance.governance.onchain_hooks.soroban import get_soroban_transaction
+from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
 from aqua_governance.governance.task_logic.proposal_finalization import (
     update_proposal_final_results,
 )
@@ -24,7 +26,7 @@ from aqua_governance.taskapp import app as celery_app
 logger = logging.getLogger(__name__)
 
 
-def _start_due_discussion_proposals(now) -> int:
+def _start_due_scheduled_proposals(now) -> int:
     started_count = 0
     with transaction.atomic():
         acquire_proposal_transition_lock()
@@ -33,18 +35,32 @@ def _start_due_discussion_proposals(now) -> int:
                 hide=False,
                 draft=False,
                 action=Proposal.NONE,
-                proposal_status=Proposal.DISCUSSION,
+                proposal_status=Proposal.QUEUED,
                 start_at__lte=now,
                 end_at__gt=now,
+                queue_slot__start_at=F('start_at'),
+                queue_slot__end_at=F('end_at'),
             ).order_by('start_at', 'id'),
         )
         for proposal in proposals:
             locked_proposal = Proposal.objects.select_for_update().get(id=proposal.id)
-            if Proposal.has_voting_activation_conflict(
+            if locked_proposal.proposal_status != Proposal.QUEUED:
+                continue
+            if locked_proposal.hide or locked_proposal.draft:
+                continue
+            if locked_proposal.action != Proposal.NONE:
+                continue
+            if locked_proposal.start_at is None or locked_proposal.start_at > now:
+                continue
+            if locked_proposal.end_at is None or locked_proposal.end_at <= now:
+                continue
+            if not ProposalQueueSlot.objects.filter(
+                proposal_id=locked_proposal.id,
                 start_at=locked_proposal.start_at,
                 end_at=locked_proposal.end_at,
-                current_proposal_id=locked_proposal.id,
-            ):
+            ).exists():
+                continue
+            if Proposal.has_active_voting_proposal_conflict(current_proposal_id=locked_proposal.id):
                 continue
             locked_proposal.proposal_status = Proposal.VOTING
             locked_proposal.save(update_fields=['proposal_status'])
@@ -64,18 +80,20 @@ def _finish_due_voting_proposals(now) -> None:
     for proposal in proposals:
         proposal.proposal_status = Proposal.VOTED
         proposal.save(update_fields=['proposal_status'])
+        sync_proposal_queue_slot(proposal)
         task_update_proposal_results.delay(proposal.id, True)
 
 
-def _expire_missed_discussion_proposals(now) -> int:
+def _expire_stale_slotless_discussion_proposals(now) -> int:
+    expired_period = now - settings.EXPIRED_TIME
     return Proposal.objects.filter(
         hide=False,
         draft=False,
         action=Proposal.NONE,
         proposal_status=Proposal.DISCUSSION,
-        start_at__isnull=False,
-        end_at__lte=now,
-    ).update(proposal_status=Proposal.EXPIRED)
+        last_updated_at__lte=expired_period,
+        queue_slot__isnull=True,
+    ).update(proposal_status=Proposal.EXPIRED, action=Proposal.NONE)
 
 
 def _mark_stale_in_progress_onchain_executions_for_review() -> None:
@@ -102,74 +120,11 @@ def _mark_stale_in_progress_onchain_executions_for_review() -> None:
 
 
 @celery_app.task(ignore_result=True)
-def task_update_proposal_status(proposal_id):
-    """
-    Update proposal status around the configured voting window.
-    """
-    proposal = Proposal.objects.get(id=proposal_id)
-    now = timezone.now()
-
-    if proposal.proposal_status == Proposal.VOTED:
-        return
-
-    if (
-        proposal.end_at
-        and proposal.end_at <= now + timedelta(seconds=5)
-        and proposal.proposal_status == Proposal.VOTING
-    ):
-        proposal.proposal_status = Proposal.VOTED
-        proposal.save(update_fields=['proposal_status'])
-        task_update_proposal_results.delay(proposal.id, True)
-        return
-
-    if (
-        proposal.end_at
-        and proposal.end_at <= now
-        and proposal.proposal_status == Proposal.DISCUSSION
-        and not proposal.draft
-        and not proposal.hide
-        and proposal.action == Proposal.NONE
-    ):
-        proposal.proposal_status = Proposal.EXPIRED
-        proposal.save(update_fields=['proposal_status'])
-        return
-
-    if (
-        proposal.start_at
-        and proposal.end_at
-        and proposal.start_at <= now < proposal.end_at
-        and proposal.proposal_status == Proposal.DISCUSSION
-        and not proposal.draft
-        and not proposal.hide
-        and proposal.action == Proposal.NONE
-    ):
-        with transaction.atomic():
-            acquire_proposal_transition_lock()
-            locked_proposal = Proposal.objects.select_for_update().get(id=proposal_id)
-            if (
-                locked_proposal.start_at
-                and locked_proposal.end_at
-                and locked_proposal.start_at <= now < locked_proposal.end_at
-                and locked_proposal.proposal_status == Proposal.DISCUSSION
-                and not locked_proposal.draft
-                and not locked_proposal.hide
-                and locked_proposal.action == Proposal.NONE
-                and not Proposal.has_voting_activation_conflict(
-                    start_at=locked_proposal.start_at,
-                    end_at=locked_proposal.end_at,
-                    current_proposal_id=locked_proposal.id,
-                )
-            ):
-                locked_proposal.proposal_status = Proposal.VOTING
-                locked_proposal.save(update_fields=['proposal_status'])
-
-
-@celery_app.task(ignore_result=True)
 def task_sync_proposal_statuses_by_time():
     now = timezone.now()
     _finish_due_voting_proposals(now)
-    _expire_missed_discussion_proposals(now)
-    _start_due_discussion_proposals(now)
+    _expire_stale_slotless_discussion_proposals(now)
+    _start_due_scheduled_proposals(now)
 
 
 @celery_app.task(ignore_result=True)
@@ -189,15 +144,7 @@ def task_check_expired_proposals():
     """
     Check expired proposals.
     """
-    now = timezone.now()
-    expired_period = now - settings.EXPIRED_TIME
-    proposals = Proposal.objects.filter(
-        proposal_status=Proposal.DISCUSSION,
-        last_updated_at__lte=expired_period,
-    ).exclude(
-        proposal_type__in=Proposal.ASSET_PROPOSAL_TYPES,
-    ).filter(Q(start_at__isnull=True) | Q(start_at__lte=now))
-    proposals.update(proposal_status=Proposal.EXPIRED, action=Proposal.NONE)
+    _expire_stale_slotless_discussion_proposals(timezone.now())
 
 
 @celery_app.task(ignore_result=True)
@@ -206,7 +153,7 @@ def task_check_pending_proposal_payments():
         hide=False,
     ).exclude(action=Proposal.NONE)
     for proposal in proposals:
-        proposal.check_transaction()
+        proposal_transactions.check_transaction(proposal)
 
 
 @celery_app.task(ignore_result=True)
@@ -448,10 +395,3 @@ def task_retry_failed_onchain_executions():
         # proposal is already VOTED and its voted_amount snapshots must
         # not be overwritten by current (possibly melted/claimed) balances.
         update_proposal_final_results(proposal.id)
-
-
-@celery_app.task(ignore_result=True)
-def check_proposals_with_bad_horizon_error():
-    failed_proposals = Proposal.objects.filter(payment_status=Proposal.HORIZON_ERROR)
-    for proposal in failed_proposals:
-        proposal.check_transaction()

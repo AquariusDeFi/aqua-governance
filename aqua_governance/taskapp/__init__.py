@@ -33,14 +33,9 @@ def setup_periodic_tasks(sender, **kwargs):
                 "schedule": crontab(minute="0", hour="*/24"),
                 "args": (),
             },
-            "aqua_governance.governance.tasks.check_proposals_with_bad_horizon_error": {
-                "task": "aqua_governance.governance.tasks.check_proposals_with_bad_horizon_error",
-                "schedule": crontab(minute="*/10"),
-                "args": (),
-            },
             "aqua_governance.governance.tasks.task_check_pending_proposal_payments": {
                 "task": "aqua_governance.governance.tasks.task_check_pending_proposal_payments",
-                "schedule": crontab(minute="*/10"),
+                "schedule": crontab(minute="*/1"),
                 "args": (),
             },
             "aqua_governance.governance.tasks.task_update_votes": {

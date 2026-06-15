@@ -36,7 +36,7 @@ class AssetProposalExpiryTests(TestCase):
         with patch_ice_circulating_supply():
             return Proposal.objects.create(**data)
 
-    def test_stale_asset_proposal_does_not_expire_from_discussion_queue(self):
+    def test_stale_asset_proposal_expires_like_other_slotless_discussion_proposals(self):
         stale_time = timezone.now() - timedelta(days=31)
         asset_proposal = self._create_proposal(Proposal.PROPOSAL_TYPE_ADD_ASSET)
         general_proposal = self._create_proposal(Proposal.PROPOSAL_TYPE_GENERAL)
@@ -46,5 +46,5 @@ class AssetProposalExpiryTests(TestCase):
 
         asset_proposal.refresh_from_db()
         general_proposal.refresh_from_db()
-        self.assertEqual(asset_proposal.proposal_status, Proposal.DISCUSSION)
+        self.assertEqual(asset_proposal.proposal_status, Proposal.EXPIRED)
         self.assertEqual(general_proposal.proposal_status, Proposal.EXPIRED)

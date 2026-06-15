@@ -1,8 +1,10 @@
+from dataclasses import dataclass
 import logging
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from stellar_sdk import Asset
 
@@ -10,6 +12,18 @@ from aqua_governance.governance.models import AssetToken, Proposal
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AssetProposalConflict:
+    proposal: Proposal
+    canonical_asset_contract_address: str
+
+
+BLOCKING_ASSET_PROPOSAL_STATUSES = (
+    Proposal.QUEUED,
+    Proposal.VOTING,
+)
 
 
 def normalize_asset_value(value):
@@ -59,6 +73,90 @@ def derive_asset_contract_address(*, asset_code, asset_issuer, asset_contract_ad
         return derived
 
     raise ValueError("Provide asset_code + asset_issuer, or asset_contract_address.")
+
+
+def get_canonical_asset_contract_address(
+    *,
+    proposal=None,
+    proposal_type=None,
+    asset_code=None,
+    asset_issuer=None,
+    asset_contract_address=None,
+    asset_token_id=None,
+):
+    if proposal is not None:
+        proposal_type = proposal.proposal_type
+        asset_code = proposal.asset_code
+        asset_issuer = proposal.asset_issuer
+        asset_contract_address = proposal.asset_contract_address
+        asset_token_id = proposal.asset_token_id
+
+    if proposal_type not in Proposal.ASSET_PROPOSAL_TYPES:
+        return None
+
+    normalized_asset_token_id = normalize_asset_value(asset_token_id)
+    if normalized_asset_token_id:
+        return normalized_asset_token_id
+
+    return derive_asset_contract_address(
+        asset_code=asset_code,
+        asset_issuer=asset_issuer,
+        asset_contract_address=asset_contract_address,
+    )
+
+
+def find_active_asset_proposal_conflict(
+    *,
+    proposal=None,
+    proposal_type=None,
+    asset_code=None,
+    asset_issuer=None,
+    asset_contract_address=None,
+    asset_token_id=None,
+    exclude_proposal_id=None,
+):
+    canonical_asset_contract_address = get_canonical_asset_contract_address(
+        proposal=proposal,
+        proposal_type=proposal_type,
+        asset_code=asset_code,
+        asset_issuer=asset_issuer,
+        asset_contract_address=asset_contract_address,
+        asset_token_id=asset_token_id,
+    )
+    if canonical_asset_contract_address is None:
+        return None
+
+    if proposal is not None and exclude_proposal_id is None:
+        exclude_proposal_id = proposal.id
+
+    queryset = Proposal.objects.filter(
+        proposal_type__in=Proposal.ASSET_PROPOSAL_TYPES,
+        hide=False,
+        draft=False,
+        proposal_status__in=BLOCKING_ASSET_PROPOSAL_STATUSES,
+    ).filter(
+        Q(asset_token_id=canonical_asset_contract_address)
+        | Q(asset_contract_address=canonical_asset_contract_address)
+    )
+    if exclude_proposal_id is not None:
+        queryset = queryset.exclude(id=exclude_proposal_id)
+
+    conflicting_proposal = queryset.order_by('created_at', 'id').first()
+    if conflicting_proposal is None:
+        return None
+
+    return AssetProposalConflict(
+        proposal=conflicting_proposal,
+        canonical_asset_contract_address=canonical_asset_contract_address,
+    )
+
+
+def serialize_asset_proposal_conflict(conflict: AssetProposalConflict):
+    return {
+        'proposal': str(conflict.proposal.id),
+        'proposal_status': conflict.proposal.proposal_status,
+        'proposal_type': conflict.proposal.proposal_type,
+    }
 
 
 def validate_asset_token_consistency(proposal):

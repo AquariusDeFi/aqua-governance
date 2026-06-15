@@ -109,3 +109,26 @@ class ProposalFilterBackendTests(TestCase):
             [vote['claimable_balance_id'] for vote in result['logvote_set']],
             [active_vote.claimable_balance_id],
         )
+
+    def test_status_filter_accepts_queued_value(self):
+        _make_general_proposal(title='Discussion', proposal_status=Proposal.DISCUSSION)
+        _make_general_proposal(title='Voting', proposal_status=Proposal.VOTING)
+        queued = _make_general_proposal(title='Queued', proposal_status=Proposal.QUEUED)
+
+        response = self.client.get('/api/proposal/', {'status': 'queued', 'ordering': '-created_at'})
+
+        self.assertEqual(response.status_code, 200)
+        results = response.json()['results']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['id'], queued.id)
+
+    def test_status_filter_with_unsupported_value_returns_all_visible(self):
+        queued = _make_general_proposal(title='Queued', proposal_status=Proposal.QUEUED)
+        voting = _make_general_proposal(title='Voting', proposal_status=Proposal.VOTING)
+
+        response = self.client.get('/api/proposal/', {'status': 'unknown_value', 'ordering': '-created_at'})
+
+        self.assertEqual(response.status_code, 200)
+        result_ids = {item['id'] for item in response.json()['results']}
+        self.assertIn(queued.id, result_ids)
+        self.assertIn(voting.id, result_ids)

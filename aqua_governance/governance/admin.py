@@ -10,7 +10,8 @@ from aqua_governance.governance.asset_tokens import (
     upsert_asset_token_from_proposal,
 )
 from aqua_governance.governance.forms import ProposalAdminForm
-from aqua_governance.governance.models import AssetToken, LogVote, Proposal
+from aqua_governance.governance.models import AssetToken, LogVote, Proposal, ProposalQueueSlot
+from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
 
 
 @admin.register(Proposal)
@@ -148,10 +149,29 @@ class ProposalAdmin(admin.ModelAdmin):
         if not request.user.is_superuser and not obj.is_asset_proposal:
             raise PermissionDenied('Managers can manage only asset proposals.')
         super().save_model(request, obj, form, change)
+        sync_proposal_queue_slot(
+            obj,
+            create_missing=self._should_create_missing_queue_slot(form=form, change=change),
+        )
         if obj.is_asset_proposal:
             upsert_asset_token_from_proposal(obj, save=True)
 
+    @staticmethod
+    def _should_create_missing_queue_slot(*, form, change: bool) -> bool:
+        if not change:
+            return True
+
+        if form is None:
+            return False
+
+        # Only create a missing slot after the admin form revalidated scheduling
+        # fields for this save. This keeps legacy slotless queued/voting rows
+        # editable without silently manufacturing a new queue occupant.
+        return bool({'proposal_status', 'start_at', 'end_at'} & set(form.changed_data))
+
     def _list_display_quorum(self, obj):
+        if not obj.ice_circulating_supply or float(obj.ice_circulating_supply) <= 0:
+            return 'Not enough votes'
         if obj.vote_for_result + obj.vote_against_result + obj.vote_abstain_result >= (
             float(obj.ice_circulating_supply)) * obj.percent_for_quorum / 100:
             return 'Enough votes'
@@ -350,3 +370,52 @@ class AssetTokenAdmin(admin.ModelAdmin):
         return getattr(obj, 'proposal_count', obj.proposals.count())
 
     _proposal_count.short_description = 'Proposals'
+
+
+@admin.register(ProposalQueueSlot)
+class ProposalQueueSlotAdmin(admin.ModelAdmin):
+    list_display = [
+        'proposal_id',
+        'proposal_title',
+        'proposal_status',
+        'start_at',
+        'end_at',
+        'occupied_at',
+    ]
+    readonly_fields = [
+        'proposal',
+        'proposal_title',
+        'proposal_status',
+        'start_at',
+        'end_at',
+        'occupied_at',
+    ]
+    fields = readonly_fields
+    search_fields = [
+        '=proposal__id',
+        'proposal__title',
+    ]
+    list_filter = [
+        ('start_at', admin.DateFieldListFilter),
+        ('end_at', admin.DateFieldListFilter),
+        ('occupied_at', admin.DateFieldListFilter),
+    ]
+    ordering = ['start_at', 'proposal_id']
+    list_select_related = ('proposal',)
+
+    @admin.display(description='proposal title')
+    def proposal_title(self, obj):
+        return obj.proposal.title
+
+    @admin.display(description='proposal status')
+    def proposal_status(self, obj):
+        return obj.proposal.proposal_status
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
