@@ -212,7 +212,7 @@ Phase 4 — Bulk DB operations:
 | vote_against_result | DecimalField(20,7) | Aggregated AGAINST total |
 | aqua_circulating_supply | DecimalField | AQUA supply snapshot at last update |
 | ice_circulating_supply | DecimalField | ICE supply snapshot at last update |
-| percent_for_quorum | PositiveSmallIntegerField | Default 10 (= 10% quorum required) |
+| percent_for_quorum | PositiveSmallIntegerField | Default 20 (= 20% quorum required) |
 | hide | BooleanField | Soft delete (excluded from all public endpoints) |
 | draft | BooleanField | True until creation payment verified |
 | is_simple_proposal | BooleanField | Reserved for future custom voting options |
