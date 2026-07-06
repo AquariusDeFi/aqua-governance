@@ -518,4 +518,5 @@ def _make_updated_vote(vote: LogVote, vote_group_index: int, claimable_balance: 
         original_amount=original_amount,
         vote_id=vote.id,
         freezing_amount=freezing_amount,
+        original_voted_amount=vote.voted_amount
     )

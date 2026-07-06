@@ -1,21 +1,93 @@
 import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models, transaction
-from django.utils import timezone
+from django.db import models
 
-from aqua_governance.governance.db_locks import acquire_asset_proposal_transition_lock
+from aqua_governance.governance.onchain_actions import derive_proposal_onchain_action_args
+from aqua_governance.governance import payment_statuses
+from aqua_governance.governance import proposal_constants
 from django_quill.fields import QuillField
-from model_utils import FieldTracker
 from stellar_sdk import Keypair
 
 
-class Proposal(models.Model):
-    HORIZON_ERROR = 'HORIZON_ERROR'
-    BAD_MEMO = 'BAD_MEMO'
-    INVALID_PAYMENT = 'INVALID_PAYMENT'
-    FINE = 'FINE'
-    FAILED_TRANSACTION = 'FAILED_TRANSACTION'
+class AssetToken(models.Model):
+    CONTRACT_SYNC_PENDING = 'PENDING'
+    CONTRACT_SYNC_SYNCED = 'SYNCED'
+    CONTRACT_SYNC_FAILED = 'FAILED'
+    CONTRACT_SYNC_REQUIRES_REVIEW = 'REQUIRES_REVIEW'
+    CONTRACT_SYNC_STATUS_CHOICES = (
+        (CONTRACT_SYNC_SYNCED, 'Contract is up to date with DB state'),
+        (CONTRACT_SYNC_PENDING, 'Waiting for contract update'),
+        (CONTRACT_SYNC_FAILED, 'Contract update failed'),
+        (CONTRACT_SYNC_REQUIRES_REVIEW, 'Contract update requires manual review'),
+    )
+
+    contract_address = models.CharField(max_length=128, primary_key=True)
+    classic_code = models.CharField(max_length=64, null=True, blank=True)
+    classic_issuer = models.CharField(max_length=56, null=True, blank=True)
+    whitelisted = models.BooleanField(default=False)
+    whitelisted_since = models.DateTimeField(null=True, blank=True)
+    unwhitelisted_since = models.DateTimeField(null=True, blank=True)
+    last_execution_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    # Contract synchronisation state: tracks whether the on-chain asset-registry
+    # contract reflects the DB whitelisted flag.
+    # Default SYNCED ensures backfilled tokens from 0028 (which already passed
+    # on-chain execution) are treated as consistent with the contract.
+    contract_sync_status = models.CharField(
+        choices=CONTRACT_SYNC_STATUS_CHOICES,
+        max_length=16,
+        default=CONTRACT_SYNC_SYNCED,
+        db_index=True,
+    )
+    contract_sync_tx_hash = models.CharField(max_length=128, null=True, blank=True)
+    contract_sync_updated_at = models.DateTimeField(null=True, blank=True)
+    contract_sync_error = models.TextField(null=True, blank=True)
+
+    def __str__(self):
+        return self.contract_address
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['last_execution_at'], name='gov_assettoken_last_exec_at'),
+        ]
+
+
+class AssetProposalInfo(models.Model):
+    # Mandatory only for asset proposal types.
+    asset_code = models.CharField(max_length=64, null=True, blank=True)
+    asset_issuer = models.CharField(max_length=56, null=True, blank=True)
+    asset_contract_address = models.CharField(max_length=128, null=True, blank=True)
+    asset_issuer_information = models.TextField(null=True, blank=True)
+    asset_token_description = models.TextField(null=True, blank=True)
+    asset_holder_distribution = models.TextField(null=True, blank=True)
+    asset_liquidity = models.TextField(null=True, blank=True)
+    asset_trading_volume = models.TextField(null=True, blank=True)
+    asset_audit_info = models.TextField(null=True, blank=True)
+    asset_stellar_flags = models.TextField(null=True, blank=True)
+    asset_related_projects = models.TextField(null=True, blank=True)
+    asset_community_references = models.TextField(null=True, blank=True)
+    asset_aquarius_traction = models.TextField(null=True, blank=True)
+    asset_issuer_commitments = models.TextField(null=True, blank=True)
+    asset_token = models.ForeignKey(
+        AssetToken,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='proposals',
+    )
+
+    class Meta:
+        abstract = True
+
+
+class Proposal(AssetProposalInfo):
+    HORIZON_ERROR = payment_statuses.HORIZON_ERROR
+    BAD_MEMO = payment_statuses.BAD_MEMO
+    INVALID_PAYMENT = payment_statuses.INVALID_PAYMENT
+    FINE = payment_statuses.FINE
+    FAILED_TRANSACTION = payment_statuses.FAILED_TRANSACTION
 
     PROPOSAL_STATUS_CHOICES = (
         (HORIZON_ERROR, 'Bad horizon response'),
@@ -25,17 +97,13 @@ class Proposal(models.Model):
         (FAILED_TRANSACTION, 'Transaction unsuccessful'),
     )  # TODO: remove it
 
-    DISCUSSION = 'DISCUSSION'
-    VOTING = 'VOTING'
-    VOTED = 'VOTED'
-    EXPIRED = 'EXPIRED'
+    DISCUSSION = proposal_constants.PROPOSAL_STATUS_DISCUSSION
+    QUEUED = proposal_constants.PROPOSAL_STATUS_QUEUED
+    VOTING = proposal_constants.PROPOSAL_STATUS_VOTING
+    VOTED = proposal_constants.PROPOSAL_STATUS_VOTED
+    EXPIRED = proposal_constants.PROPOSAL_STATUS_EXPIRED
 
-    NEW_PROPOSAL_STATUS_CHOICES = (
-        (DISCUSSION, 'Proposal under discussion'),
-        (VOTING, 'Proposal under voting'),
-        (VOTED, 'Voted'),
-        (EXPIRED, 'Expired'),
-    )
+    NEW_PROPOSAL_STATUS_CHOICES = proposal_constants.PROPOSAL_STATUS_CHOICES
 
     PAYMENT_STATUS_CHOICES = (
         (HORIZON_ERROR, 'Bad horizon response'),
@@ -45,17 +113,12 @@ class Proposal(models.Model):
         (FINE, 'Fine'),
     )
 
-    NONE = 'NONE'
-    TO_UPDATE = 'TO_UPDATE'
-    TO_SUBMIT = 'TO_SUBMIT'
-    TO_CREATE = 'TO_CREATE'
+    NONE = proposal_constants.PROPOSAL_ACTION_NONE
+    TO_UPDATE = proposal_constants.PROPOSAL_ACTION_TO_UPDATE
+    TO_SUBMIT = proposal_constants.PROPOSAL_ACTION_TO_SUBMIT
+    TO_CREATE = proposal_constants.PROPOSAL_ACTION_TO_CREATE
 
-    PROPOSAL_ACTION_CHOICES = (
-        (TO_UPDATE, 'To update'),
-        (TO_SUBMIT, 'To submit'),
-        (TO_CREATE, 'To create'),
-        (NONE, 'None'),
-    )
+    PROPOSAL_ACTION_CHOICES = proposal_constants.PROPOSAL_ACTION_CHOICES
 
     PROPOSAL_TYPE_GENERAL = 'GENERAL'
     PROPOSAL_TYPE_ADD_ASSET = 'ADD_ASSET'
@@ -156,21 +219,6 @@ class Proposal(models.Model):
     )
     action = models.CharField(choices=PROPOSAL_ACTION_CHOICES, max_length=64, default=NONE)
 
-    # Asset proposal payload (section 5). Mandatory only for proposal_type=ASSET.
-    asset_code = models.CharField(max_length=64, null=True, blank=True)
-    asset_issuer = models.CharField(max_length=56, null=True, blank=True)
-    asset_contract_address = models.CharField(max_length=128, null=True, blank=True)
-    asset_issuer_information = models.TextField(null=True, blank=True)
-    asset_token_description = models.TextField(null=True, blank=True)
-    asset_holder_distribution = models.TextField(null=True, blank=True)
-    asset_liquidity = models.TextField(null=True, blank=True)
-    asset_trading_volume = models.TextField(null=True, blank=True)
-    asset_audit_info = models.TextField(null=True, blank=True)
-    asset_stellar_flags = models.TextField(null=True, blank=True)
-    asset_related_projects = models.TextField(null=True, blank=True)
-    asset_community_references = models.TextField(null=True, blank=True)
-    asset_aquarius_traction = models.TextField(null=True, blank=True)
-    asset_issuer_commitments = models.TextField(null=True, blank=True)
     onchain_execution_status = models.CharField(
         choices=ONCHAIN_EXECUTION_STATUS_CHOICES,
         max_length=32,
@@ -180,8 +228,6 @@ class Proposal(models.Model):
     onchain_execution_started_at = models.DateTimeField(null=True, blank=True)
     onchain_execution_submitted_at = models.DateTimeField(null=True, blank=True)
     onchain_execution_poll_count = models.PositiveIntegerField(default=0)
-
-    voting_time_tracker = FieldTracker(fields=['start_at', 'end_at'])
 
     def __str__(self):
         return str(self.id)
@@ -201,9 +247,8 @@ class Proposal(models.Model):
         return self.payment_status
 
     @classmethod
-    def has_active_asset_proposal_conflict(cls, current_proposal_id=None) -> bool:
+    def has_active_voting_proposal_conflict(cls, current_proposal_id=None) -> bool:
         queryset = cls.objects.filter(
-            proposal_type__in=cls.ASSET_PROPOSAL_TYPES,
             hide=False,
             draft=False,
             proposal_status=cls.VOTING,
@@ -211,23 +256,6 @@ class Proposal(models.Model):
         if current_proposal_id is not None:
             queryset = queryset.exclude(id=current_proposal_id)
         return queryset.exists()
-
-    @classmethod
-    def has_asset_voting_interval_conflict(cls, start_at, end_at, current_proposal_id=None) -> bool:
-        queryset = cls.objects.filter(
-            proposal_type__in=cls.ASSET_PROPOSAL_TYPES,
-            hide=False,
-            draft=False,
-            proposal_status__in=(cls.DISCUSSION, cls.VOTING),
-            start_at__isnull=False,
-            end_at__isnull=False,
-        )
-        if current_proposal_id is not None:
-            queryset = queryset.exclude(id=current_proposal_id)
-        return queryset.filter(
-            start_at__lt=end_at,
-            end_at__gt=start_at,
-        ).exists()
 
     @property
     def onchain_action_type(self) -> str:
@@ -241,101 +269,20 @@ class Proposal(models.Model):
     def onchain_action_args(self) -> list[str]:
         if not self.is_asset_proposal:
             return []
+        if self.asset_token_id:
+            return [self.asset_token_id]
 
-        from aqua_governance.governance.onchain_hooks.validators import derive_onchain_action_args
-
-        return derive_onchain_action_args(
+        return derive_proposal_onchain_action_args(
             asset_code=self.asset_code,
             asset_issuer=self.asset_issuer,
             asset_contract_address=self.asset_contract_address,
         )
 
-    def check_transaction(self):
-        from aqua_governance.utils.payments import check_proposal_status
-
-        if self.action == self.TO_UPDATE:
-            status = check_proposal_status(self.new_transaction_hash, self.new_text.html,
-                                           settings.PROPOSAL_CREATE_OR_UPDATE_COST)
-            if status == self.FINE:
-                HistoryProposal.objects.create(
-                    version=self.version,
-                    title=self.title,
-                    text=self.text,
-                    transaction_hash=self.transaction_hash,
-                    envelope_xdr=self.envelope_xdr,
-                    proposal=self,
-                    created_at=self.last_updated_at,
-                )
-                self.payment_status = status
-                self.last_updated_at = timezone.now()
-                self.text = self.new_text
-                self.title = self.new_title
-                self.version = self.version + 1
-                self.transaction_hash = self.new_transaction_hash
-                self.envelope_xdr = self.new_envelope_xdr
-                self.action = self.NONE
-                self.save()
-            else:
-                self.payment_status = status
-                self.save()
-
-        elif self.action == self.TO_SUBMIT:
-            status = check_proposal_status(self.new_transaction_hash, self.text.html, settings.PROPOSAL_SUBMIT_COST)
-            if status == self.FINE:
-                HistoryProposal.objects.create(
-                    version=self.version,
-                    hide=True,
-                    title=self.title,
-                    text=self.text,
-                    transaction_hash=self.transaction_hash,
-                    envelope_xdr=self.envelope_xdr,
-                    proposal=self,
-                    created_at=self.last_updated_at,
-                )
-                now = timezone.now()
-                self.payment_status = status
-                self.start_at = self.new_start_at
-                self.end_at = self.new_end_at
-                if self.end_at and self.end_at <= now:
-                    self.proposal_status = self.EXPIRED
-                elif self.start_at and self.start_at > now:
-                    self.proposal_status = self.DISCUSSION
-                else:
-                    self.proposal_status = self.VOTING
-                self.last_updated_at = now
-                self.transaction_hash = self.new_transaction_hash
-                self.envelope_xdr = self.new_envelope_xdr
-                self.action = self.NONE
-                self.save()
-            else:
-                self.payment_status = status
-                self.save()
-
-        elif self.action == self.TO_CREATE:
-            status = check_proposal_status(self.transaction_hash, self.text.html,
-                                           settings.PROPOSAL_CREATE_OR_UPDATE_COST)
-            if not (status == self.HORIZON_ERROR and self.status == self.HORIZON_ERROR):
-                if self.is_asset_proposal and status != self.HORIZON_ERROR:
-                    with transaction.atomic():
-                        acquire_asset_proposal_transition_lock()
-                        locked_proposal = Proposal.objects.select_for_update().get(id=self.id)
-                        if locked_proposal.action == self.TO_CREATE:
-                            locked_proposal.draft = False
-                            locked_proposal.action = self.NONE
-                            locked_proposal.last_updated_at = timezone.now()
-                            if status != self.FINE:
-                                locked_proposal.hide = True
-                            locked_proposal.payment_status = status
-                            locked_proposal.save()
-                    self.refresh_from_db()
-                else:
-                    if status != self.HORIZON_ERROR:
-                        self.draft = False
-                        self.action = self.NONE
-                        if status != self.FINE:
-                            self.hide = True
-                    self.payment_status = status
-                    self.save()
+    def clean(self):
+        super().clean()
+        if self.is_asset_proposal and self.asset_token_id:
+            from aqua_governance.governance.asset_tokens import validate_asset_token_consistency
+            validate_asset_token_consistency(self)
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
         if not self.vote_against_issuer:
@@ -404,9 +351,30 @@ class Proposal(models.Model):
             })
 
     class Meta:
+        indexes = [
+            models.Index(fields=['asset_token', 'hide', 'draft'], name='gov_proposal_at_hidedraft'),
+        ]
         permissions = [
             ('manage_asset_proposals', 'Can manage asset proposals in admin'),
         ]
+
+
+class ProposalQueueSlot(models.Model):
+    proposal = models.OneToOneField(
+        Proposal,
+        primary_key=True,
+        on_delete=models.CASCADE,
+        related_name='queue_slot',
+    )
+    start_at = models.DateTimeField(unique=True)
+    end_at = models.DateTimeField()
+    occupied_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['start_at', 'proposal_id']
+
+    def __str__(self):
+        return f'{self.proposal_id}: {self.start_at.isoformat()} -> {self.end_at.isoformat()}'
 
 
 class LogVote(models.Model):

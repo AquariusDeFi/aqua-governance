@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Optional
 
 from django.conf import settings
@@ -13,8 +14,8 @@ GDICE_ASSET = Asset(settings.GDICE_ASSET_CODE, settings.GDICE_ASSET_ISSUER)
 
 
 def parse_vote(vote_key: str, vote_group_index: int, claimable_balance: dict, proposal: Proposal, vote_choice: str,
-               created_at: str, original_amount: str, vote_id: Optional[int], freezing_amount: bool = False) -> \
-Optional[LogVote]:
+               created_at: str, original_amount: str, vote_id: Optional[int], freezing_amount: bool = False,
+               original_voted_amount: Optional[Decimal] = None) -> Optional[LogVote]:
     balance_id = claimable_balance['id']
     asset = parse_asset_string(claimable_balance['asset'])
     asset_code = claimable_balance['asset'].split(':')[0]
@@ -28,9 +29,10 @@ Optional[LogVote]:
     if not time_list:
         return None
 
-    voted_amount = None
     if freezing_amount:
         voted_amount = amount
+    else:
+        voted_amount = original_voted_amount
 
     return LogVote(
         id=vote_id,

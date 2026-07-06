@@ -25,10 +25,13 @@ def build_logvote_prefetch(request, public_key: Optional[str] = None) -> Prefetc
 
 
 def apply_vote_owner_queryset_filters(queryset, request, public_key: str):
-    queryset = queryset.filter(logvote__account_issuer=public_key, logvote__hide=False)
+    filter_kwargs = {
+        'logvote__account_issuer': public_key,
+        'logvote__hide': False,
+    }
     if is_active_vote_query(request):
-        queryset = queryset.filter(logvote__claimed=False)
-    return queryset.distinct()
+        filter_kwargs['logvote__claimed'] = False
+    return queryset.filter(**filter_kwargs).distinct()
 
 
 class HideFilterBackend(BaseFilterBackend):  # TODO: remove it
@@ -62,6 +65,9 @@ class ProposalStatusFilterBackend(BaseFilterBackend):
 
         if status_value == 'expired':
             return queryset.filter(proposal_status=Proposal.EXPIRED)
+
+        if status_value == 'queued':
+            return queryset.filter(proposal_status=Proposal.QUEUED)
 
         return queryset
 

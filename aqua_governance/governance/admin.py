@@ -1,8 +1,17 @@
+from django import forms
 from django.contrib import admin
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import transaction
+from django.db.models import Count
 
+from aqua_governance.governance.asset_tokens import (
+    derive_asset_contract_address,
+    normalize_asset_value,
+    upsert_asset_token_from_proposal,
+)
 from aqua_governance.governance.forms import ProposalAdminForm
-from aqua_governance.governance.models import LogVote, Proposal
+from aqua_governance.governance.models import AssetToken, LogVote, Proposal, ProposalQueueSlot
+from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
 
 
 @admin.register(Proposal)
@@ -50,6 +59,12 @@ class ProposalAdmin(admin.ModelAdmin):
         css = {
             'all': ('admin/django_quill.css',),
         }
+
+    def changeform_view(self, request, object_id=None, form_url='', extra_context=None):
+        if request.method == 'POST':
+            with transaction.atomic():
+                return super().changeform_view(request, object_id, form_url, extra_context)
+        return super().changeform_view(request, object_id, form_url, extra_context)
 
     def get_form(self, request, obj=None, change=False, **kwargs):
         form_class = super().get_form(request, obj, change=change, **kwargs)
@@ -134,8 +149,29 @@ class ProposalAdmin(admin.ModelAdmin):
         if not request.user.is_superuser and not obj.is_asset_proposal:
             raise PermissionDenied('Managers can manage only asset proposals.')
         super().save_model(request, obj, form, change)
+        sync_proposal_queue_slot(
+            obj,
+            create_missing=self._should_create_missing_queue_slot(form=form, change=change),
+        )
+        if obj.is_asset_proposal:
+            upsert_asset_token_from_proposal(obj, save=True)
+
+    @staticmethod
+    def _should_create_missing_queue_slot(*, form, change: bool) -> bool:
+        if not change:
+            return True
+
+        if form is None:
+            return False
+
+        # Only create a missing slot after the admin form revalidated scheduling
+        # fields for this save. This keeps legacy slotless queued/voting rows
+        # editable without silently manufacturing a new queue occupant.
+        return bool({'proposal_status', 'start_at', 'end_at'} & set(form.changed_data))
 
     def _list_display_quorum(self, obj):
+        if not obj.ice_circulating_supply or float(obj.ice_circulating_supply) <= 0:
+            return 'Not enough votes'
         if obj.vote_for_result + obj.vote_against_result + obj.vote_abstain_result >= (
             float(obj.ice_circulating_supply)) * obj.percent_for_quorum / 100:
             return 'Enough votes'
@@ -197,4 +233,189 @@ class LogVoteAdmin(admin.ModelAdmin):
         return False
 
     def has_add_permission(self, request):
+        return False
+
+
+@admin.register(AssetToken)
+class AssetTokenAdmin(admin.ModelAdmin):
+    list_display = [
+        'contract_address',
+        'classic_code',
+        'classic_issuer',
+        'whitelisted',
+        'whitelisted_since',
+        'unwhitelisted_since',
+        'last_execution_at',
+        'contract_sync_status',
+        'contract_sync_tx_hash',
+        'contract_sync_updated_at',
+        '_proposal_count',
+        'created_at',
+        'updated_at',
+    ]
+    search_fields = [
+        '=contract_address',
+        'classic_code',
+        'classic_issuer',
+        'contract_sync_tx_hash',
+    ]
+    list_filter = [
+        'whitelisted',
+        'contract_sync_status',
+        ('whitelisted_since', admin.DateFieldListFilter),
+        ('unwhitelisted_since', admin.DateFieldListFilter),
+        ('last_execution_at', admin.DateFieldListFilter),
+        ('contract_sync_updated_at', admin.DateFieldListFilter),
+        ('created_at', admin.DateFieldListFilter),
+    ]
+    ordering = ['-last_execution_at', '-created_at']
+    readonly_fields = [
+        'contract_address',
+        'classic_code',
+        'classic_issuer',
+        'whitelisted',
+        'whitelisted_since',
+        'unwhitelisted_since',
+        'last_execution_at',
+        'contract_sync_status',
+        'contract_sync_tx_hash',
+        'contract_sync_updated_at',
+        'contract_sync_error',
+        'created_at',
+        'updated_at',
+    ]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(proposal_count=Count('proposals'))
+
+    def has_module_permission(self, request):
+        return bool(
+            request.user.is_superuser
+            or request.user.has_perm('governance.manage_asset_proposals')
+        )
+
+    def has_add_permission(self, request):
+        if request.user.is_superuser:
+            return True
+        return bool(
+            request.user.is_authenticated
+            and request.user.has_perm('governance.manage_asset_proposals')
+        )
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_view_permission(self, request, obj=None):
+        if request.user.is_superuser:
+            return True
+        return bool(
+            request.user.is_authenticated
+            and request.user.has_perm('governance.manage_asset_proposals')
+        )
+
+    def get_fields(self, request, obj=None):
+        if obj is None:
+            return ['contract_address', 'classic_code', 'classic_issuer']
+        return super().get_fields(request, obj=obj)
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None:
+            return [f for f in self.readonly_fields if f not in ('contract_address', 'classic_code', 'classic_issuer')]
+        return self.readonly_fields
+
+    def get_form(self, request, obj=None, change=False, **kwargs):
+        form = super().get_form(request, obj=obj, change=change, **kwargs)
+
+        if obj is None:
+            # Redeclare contract_address as optional on add so it can be
+            # auto-derived from classic_code + classic_issuer in clean().
+            class AssetTokenAddForm(form):
+                contract_address = forms.CharField(
+                    required=False,
+                    max_length=128,
+                )
+
+                def clean(self):
+                    cleaned_data = super().clean()
+                    code = normalize_asset_value(cleaned_data.get('classic_code'))
+                    issuer = normalize_asset_value(cleaned_data.get('classic_issuer'))
+                    contract = normalize_asset_value(cleaned_data.get('contract_address'))
+                    try:
+                        derived = derive_asset_contract_address(
+                            asset_code=code,
+                            asset_issuer=issuer,
+                            asset_contract_address=contract,
+                        )
+                        cleaned_data['contract_address'] = derived
+                    except ValueError as e:
+                        message = str(e)
+                        if 'Provide both asset_code and asset_issuer together' in message:
+                            raise ValidationError({
+                                'classic_code': message,
+                                'classic_issuer': message,
+                            })
+                        if 'does not match' in message:
+                            raise ValidationError({'contract_address': message})
+                        raise ValidationError(message)
+                    return cleaned_data
+
+            return AssetTokenAddForm
+
+        return form
+
+    def _proposal_count(self, obj):
+        return getattr(obj, 'proposal_count', obj.proposals.count())
+
+    _proposal_count.short_description = 'Proposals'
+
+
+@admin.register(ProposalQueueSlot)
+class ProposalQueueSlotAdmin(admin.ModelAdmin):
+    list_display = [
+        'proposal_id',
+        'proposal_title',
+        'proposal_status',
+        'start_at',
+        'end_at',
+        'occupied_at',
+    ]
+    readonly_fields = [
+        'proposal',
+        'proposal_title',
+        'proposal_status',
+        'start_at',
+        'end_at',
+        'occupied_at',
+    ]
+    fields = readonly_fields
+    search_fields = [
+        '=proposal__id',
+        'proposal__title',
+    ]
+    list_filter = [
+        ('start_at', admin.DateFieldListFilter),
+        ('end_at', admin.DateFieldListFilter),
+        ('occupied_at', admin.DateFieldListFilter),
+    ]
+    ordering = ['start_at', 'proposal_id']
+    list_select_related = ('proposal',)
+
+    @admin.display(description='proposal title')
+    def proposal_title(self, obj):
+        return obj.proposal.title
+
+    @admin.display(description='proposal status')
+    def proposal_status(self, obj):
+        return obj.proposal.proposal_status
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
         return False

@@ -2,6 +2,7 @@
 # IntelliJ project files
 .idea
 .vscode
+.zed
 *.iml
 out
 gen
