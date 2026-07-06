@@ -240,6 +240,12 @@ class Proposal(AssetProposalInfo):
     def is_asset_proposal(self) -> bool:
         return self.is_asset_proposal_type(self.proposal_type)
 
+    @property
+    def payment_verification_status(self) -> str:
+        if self.draft and self.action != self.NONE and self.payment_status in {self.FINE, self.HORIZON_ERROR}:
+            return 'PENDING'
+        return self.payment_status
+
     @classmethod
     def has_active_voting_proposal_conflict(cls, current_proposal_id=None) -> bool:
         queryset = cls.objects.filter(
