@@ -239,7 +239,7 @@ class ProposalAdminPermissionTests(TestCase):
             vote_against_result=0,
             vote_abstain_result=0,
             ice_circulating_supply=0,
-            percent_for_quorum=10,
+            percent_for_quorum=20,
         )
 
         self.assertEqual(self.admin._list_display_quorum(proposal), 'Not enough votes')
