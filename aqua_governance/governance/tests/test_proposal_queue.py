@@ -1,24 +1,24 @@
-from datetime import datetime, timedelta, timezone as datetime_timezone
+from datetime import datetime, timedelta
+from datetime import timezone as datetime_timezone
 from unittest.mock import patch
 
 from django.contrib.admin.sites import AdminSite
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
+
 from rest_framework.test import APIClient
 
 from aqua_governance.governance.admin import ProposalQueueSlotAdmin
 from aqua_governance.governance.models import Proposal, ProposalQueueSlot
 from aqua_governance.governance.proposal_queue import (
     get_max_booking_datetime,
+    get_min_booking_datetime,
     has_exact_weekly_range,
     is_utc_monday_start,
     validate_weekly_queue_slot,
 )
-from aqua_governance.governance.proposal_queue_slots import (
-    is_queue_slot_available,
-    sync_proposal_queue_slot,
-)
+from aqua_governance.governance.proposal_queue_slots import is_queue_slot_available, sync_proposal_queue_slot
 from aqua_governance.governance.tests._factories import make_asset_proposal_raw
 
 
@@ -38,21 +38,74 @@ class ProposalQueueHelperTests(SimpleTestCase):
         self.assertTrue(has_exact_weekly_range(start_at, start_at + timedelta(days=7, seconds=-1)))
         self.assertFalse(has_exact_weekly_range(start_at, start_at + timedelta(days=7)))
 
-    def test_get_max_booking_datetime_uses_last_sunday_second(self):
-        now = datetime(2026, 6, 10, 15, 30, 0, tzinfo=UTC)
+    def test_booking_bounds_cover_six_future_weeks(self):
+        now = datetime(2026, 7, 10, 15, 30, 0, tzinfo=UTC)
 
         self.assertEqual(
+            get_min_booking_datetime(now=now),
+            datetime(2026, 7, 13, 0, 0, 0, tzinfo=UTC),
+        )
+        self.assertEqual(
             get_max_booking_datetime(now=now, booking_horizon_weeks=6),
-            datetime(2026, 7, 19, 23, 59, 59, tzinfo=UTC),
+            datetime(2026, 8, 23, 23, 59, 59, tzinfo=UTC),
         )
 
-    @override_settings(PROPOSAL_QUEUE_BOOKING_HORIZON_WEEKS=2)
-    def test_validate_weekly_queue_slot_accepts_last_allowed_week(self):
-        now = datetime(2026, 6, 10, 15, 30, 0, tzinfo=UTC)
-        start_at = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
-        end_at = datetime(2026, 6, 21, 23, 59, 59, tzinfo=UTC)
+    def test_validate_weekly_queue_slot_accepts_first_and_sixth_future_weeks(self):
+        now = datetime(2026, 7, 10, 15, 30, 0, tzinfo=UTC)
 
-        validate_weekly_queue_slot(start_at, end_at, now=now)
+        for start_at in (
+            datetime(2026, 7, 13, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 8, 17, 0, 0, 0, tzinfo=UTC),
+        ):
+            with self.subTest(start_at=start_at):
+                validate_weekly_queue_slot(
+                    start_at,
+                    start_at + timedelta(days=7, seconds=-1),
+                    now=now,
+                    booking_horizon_weeks=6,
+                )
+
+    def test_validate_weekly_queue_slot_rejects_current_and_seventh_future_weeks(self):
+        now = datetime(2026, 7, 10, 15, 30, 0, tzinfo=UTC)
+
+        for start_at in (
+            datetime(2026, 7, 6, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 8, 24, 0, 0, 0, tzinfo=UTC),
+        ):
+            with self.subTest(start_at=start_at), self.assertRaises(ValidationError):
+                validate_weekly_queue_slot(
+                    start_at,
+                    start_at + timedelta(days=7, seconds=-1),
+                    now=now,
+                    booking_horizon_weeks=6,
+                )
+
+    def test_current_week_compatibility_accepts_exact_current_utc_week_only(self):
+        plus_two = datetime_timezone(timedelta(hours=2))
+        now = datetime(2026, 7, 10, 17, 30, 0, tzinfo=plus_two)
+        current_start = datetime(2026, 7, 6, 2, 0, 0, tzinfo=plus_two)
+        current_end = datetime(2026, 7, 13, 1, 59, 59, tzinfo=plus_two)
+
+        validate_weekly_queue_slot(
+            current_start,
+            current_end,
+            now=now,
+            booking_horizon_weeks=6,
+            allow_current_week=True,
+        )
+
+        for start_at in (
+            datetime(2026, 6, 29, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 8, 24, 0, 0, 0, tzinfo=UTC),
+        ):
+            with self.subTest(start_at=start_at), self.assertRaises(ValidationError):
+                validate_weekly_queue_slot(
+                    start_at,
+                    start_at + timedelta(days=7, seconds=-1),
+                    now=now,
+                    booking_horizon_weeks=6,
+                    allow_current_week=True,
+                )
 
     def test_validate_weekly_queue_slot_rejects_next_monday_midnight_end(self):
         start_at = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
@@ -69,8 +122,8 @@ class ProposalQueueHelperTests(SimpleTestCase):
     @override_settings(PROPOSAL_QUEUE_BOOKING_HORIZON_WEEKS=2)
     def test_validate_weekly_queue_slot_rejects_outside_booking_horizon(self):
         now = datetime(2026, 6, 10, 15, 30, 0, tzinfo=UTC)
-        start_at = datetime(2026, 6, 22, 0, 0, 0, tzinfo=UTC)
-        end_at = datetime(2026, 6, 28, 23, 59, 59, tzinfo=UTC)
+        start_at = datetime(2026, 6, 29, 0, 0, 0, tzinfo=UTC)
+        end_at = datetime(2026, 7, 5, 23, 59, 59, tzinfo=UTC)
 
         with self.assertRaises(ValidationError) as error:
             validate_weekly_queue_slot(start_at, end_at, now=now)
@@ -433,7 +486,12 @@ class ProposalQueueApiTests(TestCase):
         ProposalQueueSlot.objects.all().delete()
         self.client = APIClient()
 
-    def test_response_shape(self):
+    @patch('aqua_governance.governance.views.timezone.now')
+    @patch('aqua_governance.governance.proposal_queue.timezone.now')
+    def test_response_shape(self, mock_queue_now, mock_view_now):
+        now = datetime(2026, 6, 10, 15, 30, 0, tzinfo=UTC)
+        mock_queue_now.return_value = now
+        mock_view_now.return_value = now
         proposal = self._make_proposal(title='Queued proposal')
         self._make_slot(proposal=proposal)
         response = self.client.get('/api/proposal-queue/')
@@ -446,6 +504,8 @@ class ProposalQueueApiTests(TestCase):
             set(body.keys()),
             {'count', 'next', 'previous', 'results', 'max_booking_datetime', 'booking_horizon_weeks'},
         )
+        self.assertEqual(body['booking_horizon_weeks'], 6)
+        self.assertEqual(body['max_booking_datetime'], '2026-07-26T23:59:59Z')
 
         slot = body['results'][0]
         self.assertEqual(set(slot.keys()), EXPECTED_SLOT_KEYS)

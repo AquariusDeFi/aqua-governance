@@ -3,11 +3,11 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
+from aqua_governance.governance.asset_payload import validate_asset_payload
 from aqua_governance.governance.asset_tokens import find_active_asset_proposal_conflict
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
 from aqua_governance.governance.exceptions import ASSET_PROPOSAL_CONFLICT_DETAIL
 from aqua_governance.governance.models import Proposal
-from aqua_governance.governance.asset_payload import validate_asset_payload
 from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
 from aqua_governance.governance.proposal_queue_slots import is_queue_slot_available
 from aqua_governance.governance.serializers_v2 import ASSET_FIELDS, ASSET_REQUIRED_TEXT_FIELDS
@@ -163,7 +163,12 @@ class ProposalAdminForm(forms.ModelForm):
             if start_at and end_at:
                 now = timezone.now()
                 if weekly_slot_validation_required:
-                    validate_weekly_queue_slot(start_at, end_at, now=now)
+                    validate_weekly_queue_slot(
+                        start_at,
+                        end_at,
+                        now=now,
+                        allow_current_week=target_status == Proposal.VOTING,
+                    )
                 if queue_relevant_status:
                     if target_status == Proposal.QUEUED and start_at <= now:
                         raise ValidationError({
