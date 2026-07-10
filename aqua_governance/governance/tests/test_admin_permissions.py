@@ -1,5 +1,6 @@
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
+from datetime import timezone as datetime_timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.test import RequestFactory, TestCase
 from django.utils import timezone
+
 from django_quill.quill import Quill
 
 from aqua_governance.governance.admin import ProposalAdmin
@@ -20,6 +22,9 @@ from aqua_governance.governance.tests._factories import (
     make_asset_proposal_raw,
     patch_ice_circulating_supply,
 )
+
+
+UTC = datetime_timezone.utc
 
 
 class ProposalAdminPermissionTests(TestCase):
@@ -158,6 +163,46 @@ class ProposalAdminPermissionTests(TestCase):
         self.assertEqual(proposal.action, Proposal.NONE)
         self.assertEqual(proposal.payment_status, Proposal.FINE)
         self.assertFalse(proposal.hide)
+        mock_lock.assert_called_once_with()
+
+    @patch('aqua_governance.governance.forms.timezone.now')
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_admin_queued_rejects_current_week(self, mock_lock, mock_now):
+        start_at = datetime(2026, 7, 6, 0, 0, 0, tzinfo=UTC)
+        end_at = start_at + timedelta(days=7, seconds=-1)
+        mock_now.return_value = datetime(2026, 7, 8, 12, 0, 0, tzinfo=UTC)
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
+
+        form_class = self.admin.get_form(request)
+        form = form_class(data={
+            'proposed_by': 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+            'title': 'Queued asset proposal',
+            'text': self._quill_form_value(),
+            'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            'proposal_status': Proposal.QUEUED,
+            'start_at_0': self._split_datetime_form_value(start_at)['date'],
+            'start_at_1': self._split_datetime_form_value(start_at)['time'],
+            'end_at_0': self._split_datetime_form_value(end_at)['date'],
+            'end_at_1': self._split_datetime_form_value(end_at)['time'],
+            'discord_username': 'manager',
+            'asset_code': 'AQUA',
+            'asset_issuer': 'GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA',
+            'asset_issuer_information': 'info',
+            'asset_token_description': 'desc',
+            'asset_holder_distribution': 'distribution',
+            'asset_liquidity': 'liquidity',
+            'asset_trading_volume': 'volume',
+            'asset_audit_info': 'audit',
+            'asset_stellar_flags': 'flags',
+            'asset_related_projects': 'projects',
+            'asset_community_references': 'references',
+            'asset_aquarius_traction': 'traction',
+            'asset_issuer_commitments': 'commitments',
+        })
+
+        self.assertFalse(form.is_valid())
+        self.assertIn('end_at', form.errors)
         mock_lock.assert_called_once_with()
 
     @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
