@@ -1,13 +1,13 @@
-import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
-from aqua_governance.governance.onchain_actions import derive_proposal_onchain_action_args
-from aqua_governance.governance import payment_statuses
-from aqua_governance.governance import proposal_constants
+import requests
 from django_quill.fields import QuillField
 from stellar_sdk import Keypair
+
+from aqua_governance.governance import payment_statuses, proposal_constants
+from aqua_governance.governance.onchain_actions import derive_proposal_onchain_action_args
 
 
 class AssetToken(models.Model):
@@ -198,7 +198,7 @@ class Proposal(AssetProposalInfo):
 
     aqua_circulating_supply = models.DecimalField(decimal_places=7, max_digits=20, default=0, blank=True)
     ice_circulating_supply = models.DecimalField(decimal_places=7, max_digits=20, default=0, blank=True)
-    percent_for_quorum = models.PositiveSmallIntegerField(blank=True, default=10)
+    percent_for_quorum = models.PositiveSmallIntegerField(blank=True, default=20)
 
     discord_channel_url = models.URLField(blank=True, null=True, default=settings.DEFAULT_DISCORD_URL)
     discord_channel_name = models.CharField(max_length=64, blank=True, null=True)
@@ -239,6 +239,12 @@ class Proposal(AssetProposalInfo):
     @property
     def is_asset_proposal(self) -> bool:
         return self.is_asset_proposal_type(self.proposal_type)
+
+    @property
+    def payment_verification_status(self) -> str:
+        if self.draft and self.action != self.NONE and self.payment_status in {self.FINE, self.HORIZON_ERROR}:
+            return 'PENDING'
+        return self.payment_status
 
     @classmethod
     def has_active_voting_proposal_conflict(cls, current_proposal_id=None) -> bool:

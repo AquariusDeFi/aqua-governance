@@ -11,10 +11,7 @@ from aqua_governance.governance.asset_tokens import (
 )
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
 from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
-from aqua_governance.governance.proposal_queue_slots import (
-    find_queue_slot_conflict,
-    sync_proposal_queue_slot,
-)
+from aqua_governance.governance.proposal_queue_slots import find_queue_slot_conflict, sync_proposal_queue_slot
 from aqua_governance.utils.payments import check_proposal_status
 
 
@@ -119,7 +116,12 @@ def _check_submit_transaction(proposal):
             }
 
         try:
-            validate_weekly_queue_slot(new_start_at, new_end_at, now=now)
+            validate_weekly_queue_slot(
+                new_start_at,
+                new_end_at,
+                now=now,
+                allow_current_week=True,
+            )
         except ValidationError as exc:
             _mark_submit_retry_state(locked_proposal, status)
             _log_invalid_submit_window(locked_proposal, status, exc)

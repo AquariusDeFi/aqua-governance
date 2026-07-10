@@ -16,6 +16,7 @@ app.conf.timezone = "UTC"
 
 @app.on_after_finalize.connect
 def setup_periodic_tasks(sender, **kwargs):
+
     app.conf.beat_schedule.update(
         {
             "aqua_governance.governance.tasks.task_update_active_proposals": {

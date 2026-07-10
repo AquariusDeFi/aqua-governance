@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone as datetime_timezone
+from datetime import datetime, timedelta
+from datetime import timezone as datetime_timezone
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
-from aqua_governance.governance.proposal_constants import (
-    PROPOSAL_ACTION_NONE,
-    QUEUE_OCCUPYING_PROPOSAL_STATUSES,
-)
+from aqua_governance.governance.proposal_constants import PROPOSAL_ACTION_NONE, QUEUE_OCCUPYING_PROPOSAL_STATUSES
 
 
 UTC = datetime_timezone.utc
@@ -61,6 +59,10 @@ def has_exact_weekly_range(start_at: datetime | None, end_at: datetime | None) -
     )
 
 
+def get_min_booking_datetime(now: datetime | None = None) -> datetime:
+    return get_queue_week_start(now=now) + QUEUE_SLOT_DURATION
+
+
 def get_max_booking_datetime(
     now: datetime | None = None,
     booking_horizon_weeks: int | None = None,
@@ -73,7 +75,11 @@ def get_max_booking_datetime(
     if horizon_weeks < 1:
         raise ValueError('booking_horizon_weeks must be greater than zero.')
 
-    return get_queue_week_start(now=now) + timedelta(weeks=horizon_weeks) - QUEUE_SLOT_END_INCLUSIVE_OFFSET
+    return (
+        get_min_booking_datetime(now=now)
+        + timedelta(weeks=horizon_weeks)
+        - QUEUE_SLOT_END_INCLUSIVE_OFFSET
+    )
 
 
 def is_within_booking_horizon(
@@ -82,19 +88,24 @@ def is_within_booking_horizon(
     *,
     now: datetime | None = None,
     booking_horizon_weeks: int | None = None,
+    allow_current_week: bool = False,
 ) -> bool:
     start_at_utc = _as_utc(start_at)
     end_at_utc = _as_utc(end_at)
     if start_at_utc is None or end_at_utc is None or end_at_utc <= start_at_utc:
         return False
 
-    current_week_start = get_queue_week_start(now=now)
+    min_booking_datetime = (
+        get_queue_week_start(now=now)
+        if allow_current_week
+        else get_min_booking_datetime(now=now)
+    )
     max_booking_datetime = get_max_booking_datetime(
         now=now,
         booking_horizon_weeks=booking_horizon_weeks,
     )
     return (
-        start_at_utc >= current_week_start
+        start_at_utc >= min_booking_datetime
         and end_at_utc <= max_booking_datetime
     )
 
@@ -105,6 +116,7 @@ def validate_weekly_queue_slot(
     *,
     now: datetime | None = None,
     booking_horizon_weeks: int | None = None,
+    allow_current_week: bool = False,
 ) -> None:
     errors = {}
 
@@ -138,6 +150,7 @@ def validate_weekly_queue_slot(
         end_at_utc,
         now=now,
         booking_horizon_weeks=booking_horizon_weeks,
+        allow_current_week=allow_current_week,
     ):
         errors['end_at'] = 'Selected queue slot falls outside the booking horizon.'
 

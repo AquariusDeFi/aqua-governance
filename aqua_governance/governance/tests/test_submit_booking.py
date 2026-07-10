@@ -1,9 +1,11 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
+from datetime import timezone as datetime_timezone
 from unittest.mock import patch
 
-from django.test import TestCase
 from django.db import IntegrityError
+from django.test import TestCase
 from django.utils import timezone
+
 from rest_framework.test import APIClient
 
 from aqua_governance.governance import proposal_transactions
@@ -12,6 +14,9 @@ from aqua_governance.governance.proposal_queue import get_queue_week_start
 from aqua_governance.governance.proposal_queue_slots import QueueSlotConflict
 from aqua_governance.governance.serializers_v2 import SubmitSerializer
 from aqua_governance.governance.tests._factories import make_asset_proposal_raw, patch_ice_circulating_supply
+
+
+UTC = datetime_timezone.utc
 
 
 class SubmitBookingFlowTests(TestCase):
@@ -91,6 +96,60 @@ class SubmitBookingFlowTests(TestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn('start_at', serializer.errors)
         self.assertIn('end_at', serializer.errors)
+
+    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    def test_submit_serializer_rejects_current_week(self, _mock_check_xdr):
+        proposal = self._proposal()
+        start_at, end_at = self._week_slot(weeks_ahead=0)
+
+        serializer = SubmitSerializer(
+            proposal,
+            data={
+                'start_at': start_at,
+                'end_at': end_at,
+                'new_envelope_xdr': 'submit-xdr',
+                'new_transaction_hash': 'c' * 64,
+            },
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('end_at', serializer.errors)
+
+    @patch('aqua_governance.governance.proposal_transactions.timezone.now')
+    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
+    def test_confirmed_submit_accepts_slot_that_became_current_on_monday(
+        self,
+        _mock_check_status,
+        mock_now,
+    ):
+        start_at = datetime(2026, 7, 13, 0, 0, 0, tzinfo=UTC)
+        end_at = datetime(2026, 7, 19, 23, 59, 59, tzinfo=UTC)
+        mock_now.return_value = datetime(2026, 7, 13, 0, 0, 0, tzinfo=UTC)
+        proposal = self._proposal(
+            action=Proposal.TO_SUBMIT,
+            payment_status=Proposal.HORIZON_ERROR,
+            new_start_at=start_at,
+            new_end_at=end_at,
+            new_envelope_xdr='submit-xdr',
+            new_transaction_hash='d' * 64,
+        )
+
+        result = proposal_transactions.check_transaction(proposal)
+
+        proposal.refresh_from_db()
+        self.assertEqual(result['outcome'], 'booked')
+        self.assertEqual(proposal.proposal_status, Proposal.VOTING)
+        self.assertEqual(proposal.action, Proposal.NONE)
+        self.assertEqual(proposal.payment_status, Proposal.FINE)
+        self.assertEqual(proposal.start_at, start_at)
+        self.assertEqual(proposal.end_at, end_at)
+        self.assertIsNone(proposal.new_start_at)
+        self.assertIsNone(proposal.new_end_at)
+        self.assertTrue(ProposalQueueSlot.objects.filter(
+            proposal=proposal,
+            start_at=start_at,
+            end_at=end_at,
+        ).exists())
 
     @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
     def test_confirmed_submit_books_future_slot_and_sets_queued(self, _mock_check_status):

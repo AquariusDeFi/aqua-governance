@@ -13,7 +13,55 @@ Aqua Governance is the backend API for the Aquarius DAO voting system on the Ste
 - **Payment verification**: verifies AQUA payments for proposal creation (100K AQUA) and submission for voting (900K AQUA)
 - **Vote aggregation**: periodically indexes claimable balances from Horizon, groups them by voter key, and tallies results
 
-**Live:** https://gov.aqua.network/ | **Repo:** https://github.com/AquaToken/aqua-governance
+**Live:** https://gov.aqua.network/ | **Repo:** https://github.com/AquariusDeFi/aqua-governance
+
+Beyond general governance proposals, the service also handles **asset governance**
+(`ADD_ASSET` / `REMOVE_ASSET` proposals executed on-chain through a Soroban asset
+registry) and a **weekly voting-queue** that books fixed voting slots.
+
+---
+
+## 1a. Verification Gates
+
+Run before considering any change done, in this order. Requires the dev
+dependencies (`pipenv sync --dev`) and a reachable PostgreSQL:
+
+```bash
+pipenv run flake8                 # lint (.flake8, max line length 120)
+pipenv run isort --check-only .   # import order (.isort.cfg)
+pipenv run python manage.py migrate --noinput   # migrations apply cleanly
+pipenv run python manage.py test                # Django TestCase suite
+```
+
+These gates are the contributor's responsibility.
+Settings default to `config.settings.dev`; the suite runs against it.
+
+---
+
+## 1b. Conventions
+
+- **Style/lint:** flake8 (max line length 120) with the plugin set in `Pipfile`;
+  `isort` + `black` for imports/formatting. Match `.editorconfig`.
+- **Quotes/commas:** single quotes and trailing commas are enforced by flake8
+  plugins — follow the surrounding code.
+- **Settings:** all constants and asset/cost/timing/URL config live in
+  `config/settings/base.py`, read via `django-environ`. Add new config as an
+  `env(...)` with a sensible default; never hard-code secrets.
+- **App layout:** business logic stays in the `governance` app; Celery wiring in
+  `taskapp`; shared Stellar/Horizon helpers in `utils`. v2 serializers in
+  `serializers_v2.py`, legacy v1 in `serializers.py`.
+- **Tests:** Django `TestCase` + DRF `APIClient` under
+  `aqua_governance/governance/tests/`; use the existing `_factories` helpers.
+
+## 1c. Do Not Change Without Agreement
+
+- **Migrations** in `aqua_governance/governance/migrations/` — never edit applied
+  migrations; add new ones.
+- **On-chain execution** (`onchain_hooks/`, `onchain_actions.py`) and the
+  asset-registry contract wiring — touches real funds/secrets.
+- The `GenerateGrouKeyException` typo and the hardcoded `id=65` / v1 date cutoff
+  behaviours (see §9) — historical data artifacts.
+- Vote-key format and indexing pipeline (§4) — changing it desyncs stored votes.
 
 ---
 
@@ -197,7 +245,8 @@ Phase 4 — Bulk DB operations:
 | version | PositiveSmallIntegerField | Incremented on each verified update |
 | vote_for_issuer | CharField(56) | Auto-generated random Stellar keypair on first save |
 | vote_against_issuer | CharField(56) | Auto-generated random Stellar keypair on first save |
-| proposal_status | Choice | DISCUSSION / VOTING / VOTED / EXPIRED |
+| proposal_status | Choice | DISCUSSION / QUEUED / VOTING / VOTED / EXPIRED |
+| proposal_type | Choice | GENERAL / ADD_ASSET / REMOVE_ASSET (asset types grouped as `ASSET_PROPOSAL_TYPES`) |
 | payment_status | Choice | FINE / HORIZON_ERROR / BAD_MEMO / INVALID_PAYMENT / FAILED_TRANSACTION |
 | status | Choice | Legacy (TODO: remove) |
 | action | Choice | TO_CREATE / TO_UPDATE / TO_SUBMIT / NONE |
@@ -212,7 +261,7 @@ Phase 4 — Bulk DB operations:
 | vote_against_result | DecimalField(20,7) | Aggregated AGAINST total |
 | aqua_circulating_supply | DecimalField | AQUA supply snapshot at last update |
 | ice_circulating_supply | DecimalField | ICE supply snapshot at last update |
-| percent_for_quorum | PositiveSmallIntegerField | Default 10 (= 10% quorum required) |
+| percent_for_quorum | PositiveSmallIntegerField | Default 20 (= 20% quorum required) |
 | hide | BooleanField | Soft delete (excluded from all public endpoints) |
 | draft | BooleanField | True until creation payment verified |
 | is_simple_proposal | BooleanField | Reserved for future custom voting options |
@@ -301,7 +350,12 @@ task_update_proposal_status  [signal-triggered at end_at]
 | `api/proposal/` | ProposalViewSet | v2 current | Full CRUD + submit + check_payment; excludes `id=65` |
 | `api/test/proposal/` | TestProposalViewSet | test | Same as v2 without `id=65` exclusion; TODO: remove |
 | `api/votes-for-proposal/` | LogVoteView | both | Vote listing only |
+| `api/asset-proposal/` | AssetProposalViewSet | v2 | Asset-governance proposals (`ADD_ASSET` / `REMOVE_ASSET`) |
+| `api/asset-tokens/` | AssetTokenView | v2 | On-chain asset-token registry |
+| `api/proposal-queue/` | ProposalQueueViewSet | v2 | Weekly voting-slot booking / queue state |
 | `open/cms/` | Django Admin | — | Staff interface |
+
+Registered in `aqua_governance/governance/urls.py`.
 
 ### ProposalViewSet (v2) Custom Actions
 
@@ -436,10 +490,5 @@ Settings module defaults to `config.settings.dev`. Set `DJANGO_SETTINGS_MODULE` 
 
 ## 11. Related Docs
 
-External knowledge base at `../aquarius-knowledge/repos/aqua-governance/`:
-- `Overview.md` — High-level project overview and tech stack
-- `Models.md` — Complete model field reference with constraints and behaviors
-- `Tasks.md` — Celery task details with pipeline diagrams
-- `API.md` — API endpoint reference with filter and serializer details
-- `Business Logic.md` — Payment validation flows, vote aggregation, signal system
-- `aqua-governance MOC.md` — Map of Contents
+Deeper design notes (overview, models, tasks, API, business logic) are kept in
+the Aquarius team's internal knowledge base — ask the team for access.
