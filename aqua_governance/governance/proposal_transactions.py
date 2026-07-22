@@ -322,7 +322,7 @@ def _serialize_queue_conflict(conflict):
 
 def _log_submit_payment_not_confirmed(proposal, status):
     if status == proposal.HORIZON_ERROR:
-        _alert_operator(
+        logger.info(
             'Submit payment could not be confirmed yet; queue slot not booked.',
             extra={
                 'proposal_id': proposal.id,
