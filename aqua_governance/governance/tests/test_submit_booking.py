@@ -295,9 +295,12 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(proposal.proposal_status, Proposal.VOTING)
         self.assertTrue(ProposalQueueSlot.objects.filter(proposal=proposal, start_at=start_at, end_at=end_at).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions._alert_operator')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.HORIZON_ERROR)
-    def test_horizon_error_keeps_to_submit_without_booking_slot(self, _mock_check_status, mock_alert):
+    @patch('aqua_governance.governance.proposal_transactions.logger')
+    @patch(
+        'aqua_governance.governance.proposal_transactions.check_proposal_status',
+        return_value=Proposal.HORIZON_ERROR,
+    )
+    def test_horizon_error_keeps_to_submit_without_booking_slot(self, _mock_check_status, mock_logger):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         proposal = self._proposal(
             action=Proposal.TO_SUBMIT,
@@ -314,8 +317,8 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(proposal.action, Proposal.TO_SUBMIT)
         self.assertEqual(proposal.payment_status, Proposal.HORIZON_ERROR)
         self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
-        mock_alert.assert_called_once()
-        _call_args = mock_alert.call_args
+        mock_logger.info.assert_called_once()
+        _call_args = mock_logger.info.call_args
         self.assertIn('proposal_id', _call_args[1]['extra'])
         self.assertIn('transaction_hash', _call_args[1]['extra'])
 
@@ -568,8 +571,11 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(response.status_code, 404)
 
     @patch('aqua_governance.governance.proposal_transactions.sentry_sdk')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.HORIZON_ERROR)
-    def test_horizon_error_alerts_via_sentry(self, _mock_check_status, mock_sentry):
+    @patch(
+        'aqua_governance.governance.proposal_transactions.check_proposal_status',
+        return_value=Proposal.HORIZON_ERROR,
+    )
+    def test_horizon_error_does_not_capture_sentry_event(self, _mock_check_status, mock_sentry):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         proposal = self._proposal(
             action=Proposal.TO_SUBMIT,
@@ -581,17 +587,8 @@ class SubmitBookingFlowTests(TestCase):
 
         proposal_transactions.check_transaction(proposal)
 
-        mock_sentry.push_scope.assert_called_once()
-        scope = mock_sentry.push_scope.return_value.__enter__.return_value
-        set_extra_keys = {call.args[0] for call in scope.set_extra.call_args_list}
-        self.assertIn('proposal_id', set_extra_keys)
-        self.assertIn('transaction_hash', set_extra_keys)
-        self.assertIn('payment_status', set_extra_keys)
-        self.assertIn('action', set_extra_keys)
-        self.assertIn('proposal_status', set_extra_keys)
-        self.assertIn('selected_start_at', set_extra_keys)
-        self.assertIn('selected_end_at', set_extra_keys)
-        mock_sentry.capture_message.assert_called_once()
+        mock_sentry.push_scope.assert_not_called()
+        mock_sentry.capture_message.assert_not_called()
 
     @patch('aqua_governance.governance.proposal_transactions.sentry_sdk')
     @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
