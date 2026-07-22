@@ -22,11 +22,11 @@ claimable balances to per-proposal accounts; the service indexes and tallies the
 
 ## Tech stack
 
-Python 3.9 · Django 3.2 · Django REST Framework · Celery (RabbitMQ) · PostgreSQL · Stellar SDK (Horizon + Soroban) · django-quill-editor · Sentry.
+Python 3.10 · Django 3.2 · Django REST Framework · Celery (RabbitMQ) · PostgreSQL · Stellar SDK (Horizon + Soroban) · django-quill-editor · Sentry.
 
 ## Getting started
 
-Requires Python 3.9, PostgreSQL, and [`pipenv`](https://pipenv.pypa.io/).
+Requires Python 3.10, PostgreSQL, and [`pipenv`](https://pipenv.pypa.io/).
 RabbitMQ is only needed if you run Celery workers (in dev, tasks run eagerly).
 
 ```bash
