@@ -4,7 +4,7 @@ from django.conf import settings
 from django.db.models import Exists, F, OuterRef, Prefetch, Q
 from django.http import Http404
 from django.utils import timezone
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.generics import get_object_or_404
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -13,6 +13,7 @@ from rest_framework import status
 from rest_framework.filters import OrderingFilter
 from rest_framework.mixins import CreateModelMixin, ListModelMixin, RetrieveModelMixin, UpdateModelMixin
 from rest_framework.permissions import AllowAny
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import GenericViewSet
 from stellar_sdk import TransactionEnvelope
 
@@ -34,7 +35,6 @@ from aqua_governance.governance.proposal_queue_slots import true_queue_slot_occu
 from aqua_governance.governance.pagination import CustomPageNumberPagination
 from aqua_governance.governance.serializers import (
     LogVoteSerializer,
-    ProposalCreateSerializer,
     ProposalDetailSerializer,
     ProposalListSerializer,
 )
@@ -66,7 +66,7 @@ class AssetTokenView(ListModelMixin, GenericViewSet):
         )
 
 
-class ProposalsView(ListModelMixin, RetrieveModelMixin, CreateModelMixin, GenericViewSet):
+class ProposalsView(ListModelMixin, RetrieveModelMixin, GenericViewSet):
     queryset = Proposal.objects.filter(
         hide=False,
         draft=False,
@@ -84,8 +84,6 @@ class ProposalsView(ListModelMixin, RetrieveModelMixin, CreateModelMixin, Generi
     def get_serializer_class(self):
         if self.action == "retrieve":
             return ProposalDetailSerializer
-        elif self.action == "create":
-            return ProposalCreateSerializer
         return super().get_serializer_class()
 
     def get_queryset(self):
@@ -169,19 +167,36 @@ class ProposalViewSet(
 
         return super().get_serializer_class()
 
-    def _check_owner_permissions(self, proposal, data):
-        envelope_xdr = data.get("new_envelope_xdr", None)
+    def _reject_declared_owner_mismatch(self, proposal, data):
+        """Input-consistency check - NOT an authorization control.
+
+        The envelope is unsigned and client-supplied, so any caller can name any source
+        account; and Horizon serves the signed envelope of any past transaction, so
+        signature verification would not help either.  Authorization for a proposal
+        transition is the on-chain AQUA payment: the payer must equal ``proposed_by``
+        and the memo must commit to the transition (utils.payments.verify_payment).
+        This check only gives an honest client an early, legible error when it has the
+        wrong wallet connected.  Do not add security decisions behind it.
+        """
         try:
-            transaction_envelope = TransactionEnvelope.from_xdr(envelope_xdr, settings.NETWORK_PASSPHRASE)
+            transaction_envelope = TransactionEnvelope.from_xdr(
+                data["new_envelope_xdr"], settings.NETWORK_PASSPHRASE,
+            )
         except Exception:
-            raise PermissionDenied(detail="Horizon connection error ")
+            raise ValidationError({"new_envelope_xdr": "Unable to decode the transaction envelope."})
 
         if transaction_envelope.transaction.source.account_id != proposal.proposed_by:
             raise PermissionDenied(detail="You are not the proposal owner")
 
+    def get_throttles(self):
+        if self.action == "check_proposal_payment":
+            self.throttle_scope = "proposal_payment_check"
+            return [ScopedRateThrottle()]
+        return super().get_throttles()
+
     def perform_update(self, serializer):
         instance = self.get_object()
-        self._check_owner_permissions(instance, serializer.validated_data)
+        self._reject_declared_owner_mismatch(instance, serializer.validated_data)
         serializer.save()
 
     def partial_update(self, request, *args, **kwargs):
@@ -193,13 +208,14 @@ class ProposalViewSet(
         proposal = self.get_object()
         serializer = serializers_v2.SubmitSerializer(proposal, data=request.data)
         serializer.is_valid(raise_exception=True)
-        self._check_owner_permissions(proposal, request.data)
+        self._reject_declared_owner_mismatch(proposal, serializer.validated_data)
         serializer.save()
         return Response(data=serializer.data)
 
     @action(detail=True, methods=["post"], url_path="check_payment", url_name="check-payment")
     def check_proposal_payment(self, request, pk=None):
         proposal = self.get_object()
+
         result = proposal_transactions.check_transaction(proposal)
         if result and result.get('outcome') == 'asset_proposal_conflict':
             return Response(
@@ -222,6 +238,12 @@ class ProposalViewSet(
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+        if result and result.get('payment_status'):
+            # Report the verdict this call actually produced.  A path that persists nothing
+            # - a stale staged copy, say - leaves the stored column saying FINE from
+            # staging, and returning that would tell the owner's polling loop the transition
+            # succeeded.  Assign to the in-memory instance only - never save().
+            proposal.payment_status = result['payment_status']
         return Response(data=self.get_serializer(instance=proposal).data)
 
 

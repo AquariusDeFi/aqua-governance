@@ -10,7 +10,13 @@ from aqua_governance.governance.asset_tokens import (
     upsert_asset_token_from_proposal,
 )
 from aqua_governance.governance.forms import ProposalAdminForm
-from aqua_governance.governance.models import AssetToken, LogVote, Proposal, ProposalQueueSlot
+from aqua_governance.governance.models import (
+    AssetToken,
+    ConsumedTransaction,
+    LogVote,
+    Proposal,
+    ProposalQueueSlot,
+)
 from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
 
 
@@ -34,11 +40,13 @@ class ProposalAdmin(admin.ModelAdmin):
         'onchain_execution_status', 'onchain_execution_tx_hash',
         'onchain_execution_started_at', 'onchain_execution_submitted_at', 'onchain_execution_poll_count',
         'new_title', 'new_text', 'new_transaction_hash', 'new_envelope_xdr', 'new_start_at', 'new_end_at',
+        'payment_check_rejected_hash',
     ]
     search_fields = ['proposed_by', 'title', 'transaction_hash', 'new_transaction_hash']
     fields = [
         'proposed_by', 'title', 'text', 'proposal_type', 'is_simple_proposal', 'hide', 'draft', 'status', 'action',
-        'proposal_status', 'payment_status', 'version', 'created_at', 'last_updated_at',
+        'proposal_status', 'payment_status', 'payment_check_rejected_hash',
+        'version', 'created_at', 'last_updated_at',
         'transaction_hash', 'envelope_xdr', 'start_at', 'end_at',
         'new_title', 'new_text', 'new_transaction_hash', 'new_envelope_xdr', 'new_start_at', 'new_end_at',
         'vote_for_issuer', 'vote_against_issuer', 'abstain_issuer',
@@ -419,3 +427,23 @@ class ProposalQueueSlotAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(ConsumedTransaction)
+class ConsumedTransactionAdmin(admin.ModelAdmin):
+    list_display = ['transaction_hash', 'purpose', 'proposal', 'payer', 'created_at']
+    list_filter = ('purpose', 'created_at')
+    search_fields = ['transaction_hash', 'payer', '=proposal__id']
+    readonly_fields = ['transaction_hash', 'proposal', 'purpose', 'payer', 'created_at']
+    fields = readonly_fields
+    ordering = ['-created_at']
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        # Un-burning a hash releases a spent payment; it must be an attributable act.
+        return request.user.is_superuser

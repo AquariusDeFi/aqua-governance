@@ -80,7 +80,7 @@ class AssetProposalActivationTests(TestCase):
         self.assertEqual(int(serializer.errors['proposal_id'][0]), pending.id)
         self.assertIn('Please wait a few minutes', serializer.errors['non_field_errors'][0])
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.HORIZON_ERROR)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.HORIZON_ERROR)
     def test_create_keeps_horizon_error_proposal_visible_for_retry(self, _mock_check_xdr):
         serializer = ProposalCreateSerializer(data=self._general_create_payload())
 
@@ -92,14 +92,14 @@ class AssetProposalActivationTests(TestCase):
         self.assertEqual(proposal.action, Proposal.TO_CREATE)
         self.assertEqual(proposal.payment_status, Proposal.HORIZON_ERROR)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_create_uses_create_or_update_payment_cost(self, mock_check_xdr):
         serializer = ProposalCreateSerializer(data=self._general_create_payload())
 
         self.assertTrue(serializer.is_valid(), serializer.errors)
         serializer.save()
 
-        self.assertEqual(mock_check_xdr.call_args.args[1], settings.PROPOSAL_CREATE_OR_UPDATE_COST)
+        self.assertEqual(mock_check_xdr.call_args.kwargs['payment_amount'], settings.PROPOSAL_CREATE_OR_UPDATE_COST)
 
     @patch('aqua_governance.governance.tasks.proposal_transactions.check_transaction')
     def test_pending_payment_task_retries_visible_pending_creates(self, mock_check_transaction):
@@ -212,7 +212,7 @@ class AssetProposalActivationTests(TestCase):
 
         self.assertTrue(serializer.is_valid(), serializer.errors)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_submit_uses_submit_payment_cost(self, mock_check_xdr):
         queued = self._create_proposal()
         start_at, end_at = self._queue_window(weeks_ahead=1)
@@ -227,7 +227,7 @@ class AssetProposalActivationTests(TestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         serializer.save()
 
-        self.assertEqual(mock_check_xdr.call_args.args[1], settings.PROPOSAL_SUBMIT_COST)
+        self.assertEqual(mock_check_xdr.call_args.kwargs['payment_amount'], settings.PROPOSAL_SUBMIT_COST)
 
     def test_asset_proposal_submit_rejects_when_asset_interval_overlaps_voting(self):
         start_at, end_at = self._queue_window(weeks_ahead=1)

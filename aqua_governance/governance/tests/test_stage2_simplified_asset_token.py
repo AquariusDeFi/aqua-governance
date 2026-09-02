@@ -94,7 +94,7 @@ class SimplifiedAssetTokenTests(TestCase):
         self.assertEqual(token.classic_issuer, DEFAULT_ISSUER)
 
     def test_general_create_rejects_asset_fields(self):
-        with patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
             response = APIClient().post('/api/proposal/', {
                 'proposed_by': DEFAULT_PROPOSED_BY,
                 'title': 'General proposal',
@@ -122,7 +122,7 @@ class SimplifiedAssetTokenTests(TestCase):
             **asset_narratives(),
         }
 
-        with patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
             response = APIClient().post('/api/asset-proposal/', payload, format='json')
 
         self.assertEqual(response.status_code, 201)
@@ -353,26 +353,26 @@ class SimplifiedAssetTokenTests(TestCase):
             'proposed_by': DEFAULT_PROPOSED_BY,
             'title': 'Asset proposal',
             'text': '<p>x</p>',
-            'transaction_hash': 'g' * 64,
+            'transaction_hash': '7' * 64,
             'envelope_xdr': 'xdr',
             'discord_username': 'user',
             'asset_code': DEFAULT_CODE,
             'asset_issuer': DEFAULT_ISSUER,
             **asset_narratives(),
         }
-        with patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
             response = APIClient().post('/api/asset-proposal/', payload, format='json')
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('proposal_type', response.data)
 
     def test_general_create_rejects_asset_proposal_type(self):
-        with patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
             response = APIClient().post('/api/proposal/', {
                 'proposed_by': DEFAULT_PROPOSED_BY,
                 'title': 'General proposal',
                 'text': '<p>x</p>',
-                'transaction_hash': 'h' * 64,
+                'transaction_hash': '8' * 64,
                 'envelope_xdr': 'xdr',
                 'discord_username': 'user',
                 'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
@@ -387,7 +387,7 @@ class SimplifiedAssetTokenTests(TestCase):
             'proposed_by': DEFAULT_PROPOSED_BY,
             'title': 'Asset proposal',
             'text': '<p>x</p>',
-            'transaction_hash': 'i' * 64,
+            'transaction_hash': '9' * 64,
             'envelope_xdr': 'xdr',
             'discord_username': 'user',
             'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
@@ -396,7 +396,7 @@ class SimplifiedAssetTokenTests(TestCase):
             'asset_contract_address': wrong_address,
             **asset_narratives(),
         }
-        with patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
             response = APIClient().post('/api/asset-proposal/', payload, format='json')
 
         self.assertEqual(response.status_code, 400)

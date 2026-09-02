@@ -42,7 +42,7 @@ class SubmitBookingFlowTests(TestCase):
         end_at = start_at + timedelta(days=7, seconds=-1)
         return start_at, end_at
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_submit_serializer_stages_public_start_and_end_without_booking_slot(self, _mock_check_xdr):
         proposal = self._proposal()
         start_at, end_at = self._week_slot(weeks_ahead=1)
@@ -68,7 +68,7 @@ class SubmitBookingFlowTests(TestCase):
         self.assertIsNone(proposal.end_at)
         self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_submit_serializer_rejects_occupied_slot(self, _mock_check_xdr):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         ProposalQueueSlot.objects.create(
@@ -97,7 +97,7 @@ class SubmitBookingFlowTests(TestCase):
         self.assertIn('start_at', serializer.errors)
         self.assertIn('end_at', serializer.errors)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_submit_serializer_rejects_current_week(self, _mock_check_xdr):
         proposal = self._proposal()
         start_at, end_at = self._week_slot(weeks_ahead=0)
@@ -431,8 +431,8 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(proposal.history_proposal.count(), 0)
         mock_alert.assert_called_once()
 
-    @patch('aqua_governance.governance.views.ProposalViewSet._check_owner_permissions')
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch')
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
     def test_submit_endpoint_allows_immediate_retry_for_to_submit_conflict(self, _mock_check_status, _mock_check_xdr, _mock_owner):
         first_start_at, first_end_at = self._week_slot(weeks_ahead=1)

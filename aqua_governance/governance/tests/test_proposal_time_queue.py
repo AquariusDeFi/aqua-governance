@@ -242,7 +242,7 @@ class ProposalTimeQueueTests(TestCase):
         self.assertEqual(proposal.end_at, end_at)
         self.assertTrue(ProposalQueueSlot.objects.filter(proposal=proposal, start_at=start_at, end_at=end_at).exists())
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     @patch('aqua_governance.governance.serializers_v2.acquire_proposal_transition_lock')
     def test_submit_serializer_uses_global_transition_lock_for_general_proposal(
         self,
@@ -569,7 +569,7 @@ class ProposalTimeQueueTests(TestCase):
         mock_alert.assert_called_once()
 
 
-@patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.HORIZON_ERROR)
+@patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.HORIZON_ERROR)
 class AssetProposalCreateWithoutQueueBookingTests(TestCase):
     def setUp(self):
         super().setUp()
