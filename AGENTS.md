@@ -62,6 +62,13 @@ Settings default to `config.settings.dev`; the suite runs against it.
 - The `GenerateGrouKeyException` typo and the hardcoded `id=65` / v1 date cutoff
   behaviours (see §9) — historical data artifacts.
 - Vote-key format and indexing pipeline (§4) — changing it desyncs stored votes.
+- **The payment-authorization invariant (§4).** A transition is applied only when
+  Horizon attests a payment whose payer equals `proposed_by`, whose memo commits
+  to that transition, and none of whose resolvable hashes has been claimed
+  before; the `ConsumedTransaction` claim is the last statement of the same
+  database transaction that applies the transition. Do not move the claim, do not
+  relax the payer check, and do not reintroduce authorization at the staging
+  layer — staging is unauthenticated by design and promotion is the gate.
 
 ---
 
@@ -77,26 +84,23 @@ Settings default to `config.settings.dev`; the suite runs against it.
 │  /api/votes-for-proposal/ (vote listing with filters)       │
 │  /open/cms/              (Django admin)                      │
 └───────────────────────┬────────────────────────────────────┘
-                        │ Proposal.save() → post_save signal
-                        ▼
-┌────────────────────────────────────────────────────────────┐
-│                      SIGNAL SYSTEM                          │
-│  receivers.py: FieldTracker detects end_at change           │
-│    → task_update_proposal_status.apply_async(eta=end_at)    │
-└───────────────────────┬────────────────────────────────────┘
                         │
                         ▼
 ┌────────────────────────────────────────────────────────────┐
 │                   CELERY BEAT TASKS                         │
+│  (polling only — there are no post_save signal receivers)   │
 │                                                              │
 │  task_update_active_proposals (every 5 min)                  │
 │    └→ task_update_proposal_results                           │
 │         ├→ task_update_votes       (index CBs from Horizon) │
-│         └→ _update_proposal_final_results (sum + supply)    │
+│         └→ update_proposal_final_results (sum + supply)     │
 │                                                              │
+│  task_sync_proposal_statuses_by_time (every 1 min)           │
+│  task_check_pending_proposal_payments (every 1 min)          │
 │  task_check_expired_proposals (every 24h)                    │
-│  check_proposals_with_bad_horizon_error (every 10 min)       │
 │  task_update_votes (every 10 min, for VOTED proposals)       │
+│  task_poll_submitted_onchain_executions (every 1 min)        │
+│  task_retry_failed_onchain_executions (every 10 min)         │
 └───────────────────────┬────────────────────────────────────┘
                         │
                         ▼
@@ -122,23 +126,29 @@ aqua-governance/
 │   └── urls.py               # Root: /api/ → governance.urls; /open/cms/ → admin
 └── aqua_governance/
     ├── governance/            # Core app
-    │   ├── models.py          # Proposal, LogVote, HistoryProposal
+    │   ├── models.py          # Proposal, ConsumedTransaction, LogVote, HistoryProposal, ...
     │   ├── views.py           # ProposalViewSet (v2), ProposalsView (v1), LogVoteView
-    │   ├── serializers.py     # v1 serializers (legacy)
-    │   ├── serializers_v2.py  # ProposalCreate/Update/Submit/Detail/List serializers
-    │   ├── serializer_fields.py  # QuillField: bridges QuillField model → HTML string
+    │   ├── serializers.py     # v1 read serializers (legacy, list/detail only)
+    │   ├── serializers_v2.py  # ProposalCreate/AssetProposalCreate/Update/Submit/Detail/List
+    │   ├── serializer_fields.py  # QuillField, TransactionHashField
+    │   ├── transitions.py     # Create/Update/SubmitTransition: the verified transition
+    │   ├── proposal_transactions.py  # check_transaction: the promotion paths
+    │   ├── consumed_transactions.py  # claim_transaction_hashes (the payment ledger)
+    │   ├── consumed_transaction_backfill.py  # shared by migration 0031 and the command
+    │   ├── db_locks.py        # advisory locks: asset transition, payment sweep
     │   ├── filters.py         # DRF filter backends (status, owner, vote_owner)
     │   ├── pagination.py      # CustomPageNumberPagination (adds ?limit= param)
-    │   ├── tasks.py           # All Celery tasks + _make_new_vote/_make_updated_vote helpers
+    │   ├── tasks.py           # All Celery tasks
+    │   ├── task_logic/        # vote indexing + proposal finalization helpers
     │   ├── parser.py          # generate_vote_key, parse_vote (CB → LogVote)
-    │   ├── receivers.py       # post_save signal → apply_async(eta=end_at)
-    │   ├── exceptions.py      # ClaimableBalanceParsingError, GenerateGrouKeyException
+    │   ├── exceptions.py      # ClaimableBalanceParsingError, TransactionAlreadyConsumed, ...
+    │   ├── management/commands/  # backfill_consumed_transactions, rearm_proposal_payment_check
     │   ├── admin.py           # Django admin configuration
     │   └── urls.py            # Router registrations for all ViewSets
     ├── utils/
-    │   ├── payments.py        # check_proposal_status (on-chain), check_transaction_xdr (offline)
+    │   ├── memo.py            # canonical + legacy memo grammar, MemoExpectation
+    │   ├── payments.py        # verify_payment (Horizon), inspect_envelope (offline advisory)
     │   ├── requests.py        # load_all_records (Horizon cursor-pagination helper)
-    │   ├── signals.py         # DisableSignals context manager
     │   └── stellar/
     │       └── asset.py       # parse_asset_string helper
     └── taskapp/
@@ -155,42 +165,64 @@ aqua-governance/
 (POST /api/proposal/)
       │
       ▼
-  [draft=True]  ←── offline XDR check (check_transaction_xdr)
-      │               FINE → payment_status=FINE
-      │               else → hide=True, payment_status=<error>
+  [draft=True]  ←── offline XDR inspection (inspect_envelope) — ADVISORY ONLY
+      │               the verdict is reported to the client; it authorizes nothing
       │
       ▼
- action=TO_CREATE → Proposal.check_transaction() (retry task or /check_payment)
-      │                  verifies on-chain → draft=False, action=NONE
+ action=TO_CREATE → check_transaction() (beat sweep or /check_payment/)
+      │                  Horizon verifies → draft=False, action=NONE, hash claimed
       ▼
  [DISCUSSION] ←── must wait DISCUSSION_TIME (7 days) before submit
       │
       │  (POST /api/proposal/{id}/submit/)
       ▼
- action=TO_SUBMIT → Proposal.check_transaction() → proposal_status=VOTING
-      │                  sets start_at, end_at, action=NONE
+ action=TO_SUBMIT → check_transaction() → proposal_status=QUEUED/VOTING
+      │                  sets start_at, end_at, action=NONE, books the queue slot
       │
-      ├── (end_at reached via ETA signal task) ──→ [VOTED]
+      ├── (end_at reached, task_sync_proposal_statuses_by_time) ──→ [VOTED]
       │
       └── (30 days inactive in DISCUSSION) ──→ [EXPIRED]
 ```
 
-### Payment Verification — Two Paths
+### Payment Verification — one gate, and one advisory check
 
-**Path 1: Offline XDR check** (`check_transaction_xdr` in `utils/payments.py`)
-Called immediately when a proposal is created or updated (no Horizon round-trip).
-1. Parse `envelope_xdr` with `TransactionEnvelope.from_xdr()`
-2. Scan operations for a `Payment` of ≥ cost AQUA to `AQUA_ASSET_ISSUER`
-3. Verify memo: `HashMemo(SHA256(text.html))` matches XDR memo
-4. Returns `FINE | INVALID_PAYMENT | BAD_MEMO | HORIZON_ERROR`
+**The payment is the authorization.** There is no session, token or signature auth
+anywhere in this service, and the envelope a client posts is unsigned and therefore
+worthless as a credential (Horizon will also serve the *signed* envelope of any past
+transaction to anyone). What authorizes a transition is the AQUA payment Horizon
+attests, checked at promotion time. Everything in the HTTP request — the envelope,
+the staged `new_*` copy — is a claim to be checked.
 
-**Path 2: On-chain check** (`check_proposal_status` in `utils/payments.py`)
-Called by `Proposal.check_transaction()`, triggered via retry task or `/check_payment` endpoint.
-1. Fetch transaction from Horizon by `transaction_hash`
-2. Verify `transaction_info['successful']`
-3. Call `check_payment()`: scans operations for valid AQUA payment
-4. Verify memo hash matches `SHA256(proposal_text.html)`
-5. Returns `FINE | HORIZON_ERROR | FAILED_TRANSACTION | INVALID_PAYMENT | BAD_MEMO`
+**The gate: `verify_payment` (`utils/payments.py`), called from
+`proposal_transactions.check_transaction()`** via the beat sweep or
+`POST /api/proposal/{id}/check_payment/`. Four checks, all required:
+
+- **Check A — payer.** The AQUA payment *operation*'s own source (muxed `M…` folded to
+  its `G…`) must equal `proposal.proposed_by`. Operation level, not transaction level:
+  a transaction can pay 1 AQUA from the victim and the rest from the attacker.
+- **Check B — single use.** Every hash the transaction resolves under (including a
+  fee-bump's inner and outer hash) is claimed in `ConsumedTransaction`, as the **last**
+  statement of the transaction that applies the transition. A payment authorizes exactly
+  one transition, ever; a rollback releases the claim with it.
+- **Check C — memo.** `utils/memo.py` builds a `MemoExpectation` for the transition being
+  applied. Accepted formats, canonical first: `sha256('AQUA-GOV|v1|<PURPOSE>|…')` over
+  per-field inner digests, or — only while `PROPOSAL_LEGACY_MEMO_ACCEPTED` is true — the
+  legacy `sha256(text_html)`. The memo type must be `hash`.
+- **Payment shape.** Exactly the asset, destination and exact `Decimal` amount for the
+  purpose — `PROPOSAL_CREATE_OR_UPDATE_COST` or `PROPOSAL_SUBMIT_COST`. A 900,000
+  payment does not satisfy a 100,000 obligation.
+
+Verdicts are `FINE | HORIZON_ERROR | FAILED_TRANSACTION | INVALID_PAYMENT | BAD_MEMO`.
+Only `HORIZON_ERROR` is retryable; a terminal verdict records
+`payment_check_rejected_hash` so the sweep stops re-asking Horizon about it.
+
+**The advisory check: `inspect_envelope` (`utils/payments.py`)**, called by the create /
+update / submit serializers at staging time. It parses the posted `envelope_xdr`
+offline and returns the same status vocabulary so an honest client learns *before
+signing* that its envelope is wrong. It is **not** a security control and no transition
+depends on it — anyone can post any envelope. Same for
+`ProposalViewSet._reject_declared_owner_mismatch`: it compares the envelope's declared
+source to `proposed_by` purely to give a wrong-wallet client a legible error.
 
 ### Vote Key Format
 
@@ -248,6 +280,7 @@ Phase 4 — Bulk DB operations:
 | proposal_status | Choice | DISCUSSION / QUEUED / VOTING / VOTED / EXPIRED |
 | proposal_type | Choice | GENERAL / ADD_ASSET / REMOVE_ASSET (asset types grouped as `ASSET_PROPOSAL_TYPES`) |
 | payment_status | Choice | FINE / HORIZON_ERROR / BAD_MEMO / INVALID_PAYMENT / FAILED_TRANSACTION |
+| payment_check_rejected_hash | CharField(64, null) | The pending hash a terminal verdict was recorded for; `''` means "there was no hash". Takes the row out of the beat sweep and dedups the operator alert. Cleared by every promotion, and by `manage.py rearm_proposal_payment_check` |
 | status | Choice | Legacy (TODO: remove) |
 | action | Choice | TO_CREATE / TO_UPDATE / TO_SUBMIT / NONE |
 | transaction_hash | CharField(64, unique) | Current/creation payment tx hash |
@@ -268,7 +301,25 @@ Phase 4 — Bulk DB operations:
 | discord_channel_url/name | URL/CharField | Discussion channel metadata |
 | discord_username | CharField(64) | Submitter's Discord handle |
 
-**Tracker:** `voting_time_tracker = FieldTracker(fields=['end_at'])` — used by post_save signal.
+### ConsumedTransaction
+
+The append-only payment ledger. One row per transaction hash, forever; written as the
+last statement of the transaction that applies a transition, so a hash is burned if and
+only if a transition really happened.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| transaction_hash | CharField(64, unique) | Lowercase. Uniqueness is on the hash **alone** — a composite key with `purpose` would let one payment be spent as a create *and* a submit |
+| proposal | FK(Proposal, SET_NULL, null) | Never CASCADE: superusers can delete proposals, and a cascade would un-burn their payments |
+| purpose | Choice | CREATE / UPDATE / SUBMIT / LEGACY (`LEGACY` = backfilled by migration `0031`) |
+| payer | CharField(56, null) | The verified on-chain payer, for forensics; discarded to NULL if it is not 56 chars |
+| created_at | DateTimeField | auto_now_add |
+
+The pk is a surrogate `AutoField`: with `transaction_hash` as a natural pk, `save()`
+would UPDATE over an existing claim instead of raising.
+
+Claim through `consumed_transactions.claim_transaction_hashes()` — never by creating rows
+by hand. It must be the **last** lock a transaction takes.
 
 ### LogVote
 
@@ -309,20 +360,37 @@ Phase 4 — Bulk DB operations:
 
 ### Beat Schedule
 
+Defined in `aqua_governance/taskapp/__init__.py`.
+
 | Task | Schedule | Purpose |
 |------|----------|---------|
 | `task_update_active_proposals` | Every 5 min | Re-indexes votes for all VOTING proposals |
+| `task_sync_proposal_statuses_by_time` | Every 1 min | VOTING → VOTED at `end_at`; expires stale DISCUSSION rows; starts due QUEUED proposals |
+| `task_check_pending_proposal_payments` | Every 1 min | The payment sweep: `check_transaction()` for every non-hidden row with a pending action |
 | `task_check_expired_proposals` | Every 24h | Marks DISCUSSION → EXPIRED after 30 days inactive |
-| `check_proposals_with_bad_horizon_error` | Every 10 min | Retries Horizon payment check for `HORIZON_ERROR` proposals |
 | `task_update_votes` | Every 10 min | Re-indexes votes for all VOTED proposals |
+| `task_poll_submitted_onchain_executions` | Every 1 min | Polls Soroban for submitted asset-registry executions |
+| `task_retry_failed_onchain_executions` | Every 10 min | Re-attempts FAILED/PENDING on-chain executions |
 
-### Signal-Triggered
+There are **no** signal receivers and no ETA-scheduled tasks: state advances by polling in
+`task_sync_proposal_statuses_by_time`.
 
-| Signal condition | Task | ETA |
-|-----------------|------|-----|
-| `Proposal.end_at` changed (detected by FieldTracker in post_save) | `task_update_proposal_status` | `proposal.end_at` |
+### The payment sweep
 
-`task_update_proposal_status` checks `end_at <= now + 5s`, sets `proposal_status=VOTED`, then calls `task_update_proposal_results(freezing_amount=True)`.
+`task_check_pending_proposal_payments` is the unattended caller of `check_transaction()`,
+so three properties of it are load-bearing:
+
+- **A session-level advisory lock** (`PROPOSAL_PAYMENT_SWEEP_ADVISORY_LOCK_ID`, taken in
+  `db_locks.py`) makes a tick skip while the previous one is still running. At up to three
+  Horizon round-trips per row the sweep can outlast its own 60 s period. The lock is
+  session-level, not `pg_advisory_xact_lock`: the sweep must not hold a transaction open
+  across Horizon calls, and its id must differ from the asset-transition lock, which the
+  promotions themselves take.
+- **Per-row `try/except`**, because promotion now raises for real — a rejected claim, a
+  deadlock, a programming error. One poisoned row must not stop the rows behind it.
+- **`.order_by('id')` plus a terminal-rejection filter**: rows whose pending hash equals
+  `payment_check_rejected_hash` are excluded in SQL, so a permanently-failing row stops
+  costing Horizon traffic. Re-arm one with `manage.py rearm_proposal_payment_check`.
 
 ### Task Call Chain
 
@@ -330,12 +398,17 @@ Phase 4 — Bulk DB operations:
 task_update_active_proposals
   → task_update_proposal_results(proposal_id, freezing_amount=False)
       → task_update_votes(proposal_id, False)       # indexes CBs, no vote freeze
-      → _update_proposal_final_results(proposal_id)  # sums + fetches supply
+      → update_proposal_final_results(proposal_id)  # sums + fetches supply
 
-task_update_proposal_status  [signal-triggered at end_at]
+task_sync_proposal_statuses_by_time  [every minute; end_at reached]
   → task_update_proposal_results(proposal_id, freezing_amount=True)
-      → task_update_votes(proposal_id, True)         # indexes CBs, sets voted_amount
-      → _update_proposal_final_results(proposal_id)  # final tally
+      → task_update_votes(proposal_id, True)        # indexes CBs, sets voted_amount
+      → update_proposal_final_results(proposal_id)  # final tally, then on-chain hook
+
+task_check_pending_proposal_payments  [every minute]
+  → proposal_transactions.check_transaction(proposal)   # per row, exceptions isolated
+      → utils.payments.verify_payment(...)              # Horizon: payer, amount, memo
+      → consumed_transactions.claim_transaction_hashes(...)   # last statement
 ```
 
 ---
@@ -346,7 +419,7 @@ task_update_proposal_status  [signal-triggered at end_at]
 
 | URL prefix | ViewSet | Version | Notes |
 |-----------|---------|---------|-------|
-| `api/proposals/` | ProposalsView | v1 legacy | List + retrieve + create; filtered to `created_at ≤ 2022-04-15` |
+| `api/proposals/` | ProposalsView | v1 legacy | List + retrieve **only** (POST returns 405); filtered to `created_at ≤ 2022-04-15` |
 | `api/proposal/` | ProposalViewSet | v2 current | Full CRUD + submit + check_payment; excludes `id=65` |
 | `api/test/proposal/` | TestProposalViewSet | test | Same as v2 without `id=65` exclusion; TODO: remove |
 | `api/votes-for-proposal/` | LogVoteView | both | Vote listing only |
@@ -361,8 +434,8 @@ Registered in `aqua_governance/governance/urls.py`.
 
 | Action | Method | URL | Description |
 |--------|--------|-----|-------------|
-| `submit_proposal` | POST | `/api/proposal/{id}/submit/` | Submit a DISCUSSION proposal to VOTING; requires ≥7 day discussion |
-| `check_proposal_payment` | POST | `/api/proposal/{id}/check_payment/` | Re-verify payment on-chain via Horizon |
+| `submit_proposal` | POST | `/api/proposal/{id}/submit/` | Stage a submit (`action=TO_SUBMIT`); requires ≥7 day discussion. Applies nothing on its own |
+| `check_proposal_payment` | POST | `/api/proposal/{id}/check_payment/` | The promotion gate: verify the payment on Horizon and apply the staged transition. Takes no body |
 
 ### Filter Query Parameters
 
@@ -381,11 +454,17 @@ Registered in `aqua_governance/governance/urls.py`.
 
 | Serializer | Used for | Key behaviors |
 |-----------|----------|---------------|
-| `ProposalCreateSerializer` | POST /proposal/ | Sets `draft=True`, `action=TO_CREATE`; calls `check_transaction_xdr` |
-| `ProposalUpdateSerializer` | PUT /proposal/{id}/ | Sets `action=TO_UPDATE`; uses `new_*` fields |
-| `SubmitSerializer` | POST /proposal/{id}/submit/ | Sets `action=TO_SUBMIT`; validates `new_start_at`, `new_end_at` |
+| `ProposalCreateSerializer` | POST /proposal/ | Sets `draft=True`, `action=TO_CREATE`; `inspect_envelope` for the advisory verdict only |
+| `AssetProposalCreateSerializer` | POST /asset-proposal/ | Same, plus the asset triple and narrative fields |
+| `ProposalUpdateSerializer` | PUT/PATCH /proposal/{id}/ | Stages `new_*`; `proposed_by` and `text` are read-only, and `transaction_hash` / `envelope_xdr` are neither writable nor returned |
+| `SubmitSerializer` | POST /proposal/{id}/submit/ | Stages `action=TO_SUBMIT`; validates `new_start_at`, `new_end_at` against the weekly queue |
 | `ProposalDetailSerializer` | GET /proposal/{id}/ | Includes `history_proposal` (non-hidden) |
 | `ProposalListSerializer` | GET /proposal/ | Includes `logvote_set` |
+
+All three staging serializers reject a `transaction_hash` already held by another
+proposal's hash column (`__iexact`) or already present in `ConsumedTransaction` — a
+pre-payment 400 rather than an unrecoverable promotion failure. `serializers.py` (v1)
+holds **read** serializers only; it no longer has a create path.
 
 ### `get_queryset()` Dynamic Filtering (ProposalViewSet)
 
@@ -417,12 +496,31 @@ Registered in `aqua_governance/governance/urls.py`.
 
 | Setting | Value |
 |---------|-------|
-| `PROPOSAL_CREATE_OR_UPDATE_COST` | 100,000 AQUA |
-| `PROPOSAL_SUBMIT_COST` | 900,000 AQUA |
-| `PROPOSAL_COST` | 1,000,000 (legacy constant, TODO: remove) |
+| `PROPOSAL_CREATE_OR_UPDATE_COST` | 100,000 AQUA — the exact amount a create or update payment must carry |
+| `PROPOSAL_SUBMIT_COST` | 900,000 AQUA — the exact amount a submit payment must carry |
+| `PROPOSAL_COST` | 1,000,000 — dead. Its only remaining reference is an unreached fallback branch in `payments._resolve_payment_amount`; every caller passes an explicit amount (TODO: remove) |
 | `DISCUSSION_TIME` | `timedelta(days=7)` — minimum discussion before submit |
 | `EXPIRED_TIME` | `timedelta(days=30)` — auto-expire DISCUSSION proposals |
 | `NETWORK_PASSPHRASE` | Stellar Public Network passphrase |
+
+Amounts are compared exactly, as `Decimal`. A 900,000 payment does not satisfy a
+100,000 obligation and vice versa.
+
+### Payment Verification
+
+| Setting | Value |
+|---------|-------|
+| `PROPOSAL_LEGACY_MEMO_ACCEPTED` | `True`. Whether `sha256(text_html)` is still accepted alongside the canonical `AQUA-GOV\|v1\|…` memo. Flip to `False` for v3 — an env flip with a deploy-free rollback, and the step that can strand an in-flight payment |
+| `PROPOSAL_PAYMENT_CHECK_THROTTLE_RATE` | `''` (off), wired to the `proposal_payment_check` DRF throttle scope. **No `CACHES` is configured**, so any rate is per-process locmem multiplied by the worker count — point `CACHES['default']` at Redis before enabling it |
+
+### Advisory Lock IDs
+
+Both are PostgreSQL advisory locks and both must stay distinct.
+
+| Setting | Default | Scope |
+|---------|---------|-------|
+| `ASSET_PROPOSAL_TRANSITION_ADVISORY_LOCK_ID` | 94127051 | `pg_advisory_xact_lock`, held for one asset-proposal transition |
+| `PROPOSAL_PAYMENT_SWEEP_ADVISORY_LOCK_ID` | 94127052 | `pg_try_advisory_lock` (session), held for a whole sweep run. Reusing the transition id would block every staging and promotion for the duration |
 
 ### External URLs
 
@@ -436,7 +534,7 @@ Registered in `aqua_governance/governance/urls.py`.
 
 ## 9. Important Patterns and Gotchas
 
-1. **No authentication**: All API endpoints are `AllowAny`. "Ownership" is verified by checking the XDR source account matches `proposed_by` in `_check_owner_permissions()`. No session or token auth.
+1. **No authentication, and no ownership check either.** All API endpoints are `AllowAny`, and *nothing* in the request proves ownership: the posted envelope is unsigned, so any caller can name any source account, and Horizon hands out the signed envelope of any past transaction on request. `ProposalViewSet._reject_declared_owner_mismatch()` (formerly `_check_owner_permissions()`, a name that no longer exists) compares the declared envelope source to `proposed_by` **as an input-consistency check only** — it exists to give an honest client with the wrong wallet connected a legible 403. Do not put a security decision behind it. Authorization is the on-chain payment, checked at promotion time (§4). Consequently, **staging is open**: anyone can overwrite another account's `new_title` / `new_text` / `new_transaction_hash`. That is a known, documented residual — the fix is that promotion refuses to apply what the payment does not attest, not a check at the staging layer.
 
 2. **QuillField serializer quirk**: `serializer_fields.QuillField.get_attribute()` hardcodes `instance.text.html` regardless of the field name. This works for `text` fields but must be overridden for `new_text`. `to_internal_value` wraps input HTML in a `Quill` object with empty delta.
 
@@ -444,21 +542,27 @@ Registered in `aqua_governance/governance/urls.py`.
 
 4. **Legacy v1 date cutoff**: `ProposalsView` (v1) hardcodes `created_at__lte=datetime(2022, 4, 15)`. Any proposal created after this date is invisible via the v1 API.
 
-5. **`DisableSignals` pattern**: `_update_proposal_final_results` wraps `proposal.save()` in `DisableSignals('aqua_governance.governance.receivers.save_final_result', sender=Proposal)` to prevent re-triggering the ETA scheduling signal when only updating vote result fields.
+5. **`Proposal.save()` makes an outbound HTTP call on insert**: it fetches `ICE_CIRCULATING_URL` with **no timeout**, and `AssetProposalCreateSerializer.create` runs that save inside `transaction.atomic()`. One hung request therefore holds a write transaction open. Every test that creates a `Proposal` must wrap it in `_factories.patch_ice_circulating_supply()`.
 
-6. **Staged `new_*` update pattern**: Updates/submits do not apply immediately. Fields are staged in `new_title`, `new_text`, `new_transaction_hash`, `new_envelope_xdr`, `new_start_at`, `new_end_at`, with `action` set. `check_transaction()` is called later (retry task or `/check_payment` endpoint) to promote them.
+6. **Staged `new_*` update pattern**: Updates/submits do not apply immediately. Fields are staged in `new_title`, `new_text`, `new_transaction_hash`, `new_envelope_xdr`, `new_start_at`, `new_end_at`, with `action` set. `check_transaction()` promotes them later (beat sweep or `/check_payment/`) — and promotes the transition it *verified*, never the staged columns re-read after the fact, since staging is unauthenticated and can change in between.
 
 7. **`GenerateGrouKeyException` typo**: The exception class name is intentionally `GenerateGrouKeyException` (missing 'p'). It is imported consistently across the codebase — don't rename it without updating all imports.
 
-8. **`task_update_proposal_status` 5-second tolerance**: Uses `end_at <= timezone.now() + timedelta(seconds=5)` to handle slight scheduling delays. The task is ETA-scheduled so it may arrive slightly after the exact `end_at`.
+8. **One VOTING proposal at a time**: `_start_due_scheduled_proposals` takes the asset-transition advisory lock, re-reads each candidate `select_for_update()`, checks `Proposal.has_active_voting_proposal_conflict()`, and `break`s after starting one. The global voting invariant lives in that loop, not in a constraint.
 
 9. **`freezing_amount` flag**: When `True` (called at voting end), `voted_amount` is set to the current CB amount. When `False` (called during active voting), `voted_amount` stays `None`. This freezes the vote count at the moment voting closed.
 
 10. **`partial_update` disabled**: `ProposalViewSet.partial_update()` delegates to `self.update()`, ignoring the partial flag. There is no PATCH-only path.
 
-11. **`_update_proposal_final_results` uses `update_fields`**: Only saves `['vote_for_result', 'vote_against_result', 'aqua_circulating_supply', 'ice_circulating_supply']`. This combined with `DisableSignals` prevents the post_save signal from re-scheduling ETA tasks.
+11. **`update_proposal_final_results` uses `update_fields`**: it saves only `['vote_for_result', 'vote_against_result', 'vote_abstain_result', 'ice_circulating_supply']`, then dispatches the on-chain hook if the ICE supply fetch was fresh. It lives in `task_logic/proposal_finalization.py`, not in `tasks.py`.
 
-12. **Legacy `PROPOSAL_COST`**: The constant `PROPOSAL_COST = 1000000` in settings is only used by the legacy `check_payment()` and `check_xdr_payment()` functions. All current code uses `PROPOSAL_CREATE_OR_UPDATE_COST` (100K) and `PROPOSAL_SUBMIT_COST` (900K).
+12. **Legacy `PROPOSAL_COST` is dead**: the four functions that used to read it (`check_payment`, `check_xdr_payment`, `check_proposal_status`, `check_transaction_xdr`) no longer exist. Every caller now passes an explicit `PROPOSAL_CREATE_OR_UPDATE_COST` (100K) or `PROPOSAL_SUBMIT_COST` (900K), compared exactly, so the constant is reachable only through an unexercised fallback branch in `payments._resolve_payment_amount`.
+
+13. **A hash is spent once, globally**: `ConsumedTransaction` is keyed on `transaction_hash` alone and is never updated. Never write it directly — go through `claim_transaction_hashes()`, and keep the claim as the **last** statement of the applying transaction so a rollback releases it. Deleting a proposal leaves its claims behind (`SET_NULL`) on purpose.
+
+14. **Operator commands** (`manage.py`, no other management commands exist):
+    - `backfill_consumed_transactions [--dry-run]` — rebuilds the ledger from `Proposal.transaction_hash` and `HistoryProposal.transaction_hash`, skipping in-flight `TO_CREATE` rows. Idempotent; the same code migration `0031` runs. **Mandatory once after any deploy of this app that follows the migration.**
+    - `rearm_proposal_payment_check <id> --action <ACTION> [--unhide]` — clears `payment_check_rejected_hash`, resets `payment_status`, re-sets `action`. The only remedy for a terminal verdict, since `action` and `payment_status` are in `ProposalAdmin.readonly_fields`. Logs the before/after at ERROR; does **not** un-burn a claimed hash and does not restore `draft`.
 
 ---
 
@@ -473,6 +577,10 @@ echo 'export DATABASE_URL="postgres://username:password@localhost/aqua_governanc
 
 # Apply migrations
 pipenv run python manage.py migrate --noinput
+
+# Rebuild the payment ledger (mandatory once after a deploy that lands 0031;
+# idempotent, so it is safe to re-run at any time)
+pipenv run python manage.py backfill_consumed_transactions
 
 # Run development server
 pipenv run python manage.py runserver 0.0.0.0:8000
