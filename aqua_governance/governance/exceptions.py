@@ -37,3 +37,23 @@ class AssetProposalConflictError(APIException):
                 conflict=conflict,
             )
         )
+
+
+TRANSACTION_ALREADY_CONSUMED_DETAIL = (
+    'This payment transaction has already been used for a proposal transition.'
+)
+
+
+class TransactionAlreadyConsumedError(Exception):
+    """A payment hash was already spent on a transition.
+
+    Deliberately a plain ``Exception``: the claim runs in the Celery beat sweep as well as
+    in the request path, where an ``APIException`` would surface as an unhandled task
+    failure.  It must not subclass ``IntegrityError`` either, because the submit path
+    catches that for slot-booking recovery.
+    """
+
+    def __init__(self, *, transaction_hash, existing=None):
+        self.transaction_hash = transaction_hash
+        self.existing = existing
+        super().__init__(TRANSACTION_ALREADY_CONSUMED_DETAIL)
