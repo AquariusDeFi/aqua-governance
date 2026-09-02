@@ -453,6 +453,15 @@ EXPECTED_SLOT_KEYS = {
     'occupied_at',
 }
 
+# The queue endpoint drops every slot with end_at < now, so an unpinned clock
+# empties the response once wall time passes the fixture weeks and each test
+# silently stops exercising the filter it was written for. Fixtures below book the
+# week of 2026-06-08 or a later one, and this instant sits inside that first week,
+# making it the current slot and the rest future slots. The one exception is the
+# deliberately past week in test_returns_only_current_and_future_slots: it is the
+# only fixture that exercises the end_at cutoff, so it must stay in the past.
+QUEUE_API_NOW = datetime(2026, 6, 10, 15, 30, 0, tzinfo=UTC)
+
 
 class ProposalQueueApiTests(TestCase):
     def _make_proposal(self, **overrides):
@@ -481,17 +490,25 @@ class ProposalQueueApiTests(TestCase):
             end_at=end_at,
         )
 
+    def _pin_now(self, now):
+        # Both clock readers behind the endpoint -- the end_at cutoff in
+        # ProposalQueueViewSet.get_queryset and get_max_booking_datetime -- reach
+        # django.utils.timezone.now through a module attribute resolved at call
+        # time, so a single patch on it pins the whole request. That patch is
+        # process-wide for the duration of the test: auto_now_add columns
+        # (Proposal.created_at, ProposalQueueSlot.occupied_at) are stamped with
+        # `now` as well.
+        patcher = patch('django.utils.timezone.now', return_value=now)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def setUp(self):
         Proposal.objects.all().delete()
         ProposalQueueSlot.objects.all().delete()
+        self._pin_now(QUEUE_API_NOW)
         self.client = APIClient()
 
-    @patch('aqua_governance.governance.views.timezone.now')
-    @patch('aqua_governance.governance.proposal_queue.timezone.now')
-    def test_response_shape(self, mock_queue_now, mock_view_now):
-        now = datetime(2026, 6, 10, 15, 30, 0, tzinfo=UTC)
-        mock_queue_now.return_value = now
-        mock_view_now.return_value = now
+    def test_response_shape(self):
         proposal = self._make_proposal(title='Queued proposal')
         self._make_slot(proposal=proposal)
         response = self.client.get('/api/proposal-queue/')
@@ -748,6 +765,8 @@ class ProposalQueueApiTests(TestCase):
         slot_end = datetime(2026, 7, 12, 23, 59, 59, tzinfo=UTC)
         actual_start = datetime(2026, 7, 13, 0, 0, 0, tzinfo=UTC)
         actual_end = datetime(2026, 7, 19, 23, 59, 59, tzinfo=UTC)
+        matched_start = datetime(2026, 7, 20, 0, 0, 0, tzinfo=UTC)
+        matched_end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=UTC)
 
         for status in (Proposal.QUEUED, Proposal.VOTING):
             with self.subTest(status=status):
@@ -765,12 +784,27 @@ class ProposalQueueApiTests(TestCase):
                     start_at=slot_start,
                     end_at=slot_end,
                 )
+                # Positive control in a week of its own: the ghost has to be absent
+                # from a response that is demonstrably non-empty, so an empty list
+                # -- what a dead clock or a broken queryset produces -- fails here
+                # instead of passing for the wrong reason.
+                matched_slot = self._make_slot(
+                    proposal=self._make_proposal(
+                        title=f'Matched {status.lower()} proposal',
+                        proposal_status=status,
+                    ),
+                    start_at=matched_start,
+                    end_at=matched_end,
+                )
 
                 response = self.client.get('/api/proposal-queue/')
 
                 body = response.json()
-                self.assertEqual(body['count'], 0)
-                self.assertEqual(body['results'], [])
+                self.assertEqual(body['count'], 1)
+                self.assertEqual(
+                    [result['proposal'] for result in body['results']],
+                    [matched_slot.proposal_id],
+                )
 
 
 class ProposalQueueSlotAdminTests(TestCase):

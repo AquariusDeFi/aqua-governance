@@ -5,6 +5,7 @@ from rest_framework.test import APIClient
 from stellar_sdk import Asset
 
 from aqua_governance.governance.models import AssetToken, Proposal
+from aqua_governance.governance.serializers_v2 import AssetTokenProposalSerializer
 from aqua_governance.governance.tests._factories import (
     DEFAULT_CODE,
     DEFAULT_ISSUER,
@@ -21,7 +22,7 @@ EXPECTED_TOKEN_KEYS = {
 }
 
 EXPECTED_PROPOSAL_KEYS = {
-    'id', 'proposal_type', 'proposal_status', 'title',
+    'id', 'proposal_type', 'proposal_status', 'payment_verification_status', 'title',
     'start_at', 'end_at', 'new_start_at', 'new_end_at',
     'vote_for_result', 'vote_against_result', 'vote_abstain_result',
     'onchain_execution_status', 'onchain_execution_tx_hash',
@@ -36,7 +37,10 @@ class AssetTokensApiContractTests(TestCase):
         self.client = APIClient()
 
     def test_response_shape_matches_legacy(self):
-        proposal = make_asset_proposal(title='Add AQUA')
+        # A payment status other than the model default keeps the value assertion
+        # below honest: the vestigial `status` field also defaults to FINE, so a
+        # getter reading it instead of `payment_status` would pass unnoticed.
+        proposal = make_asset_proposal(title='Add AQUA', payment_status=Proposal.BAD_MEMO)
 
         response = self.client.get('/api/asset-tokens/')
 
@@ -57,6 +61,34 @@ class AssetTokensApiContractTests(TestCase):
         self.assertEqual(set(token_card['proposals'][0].keys()), EXPECTED_PROPOSAL_KEYS)
         self.assertEqual(token_card['proposals'][0]['id'], proposal.id)
         self.assertEqual(token_card['proposals'][0]['proposal_type'], Proposal.PROPOSAL_TYPE_ADD_ASSET)
+        # The queryset serves published proposals only, so cards here always carry
+        # the raw payment status; the PENDING collapse is covered separately below.
+        self.assertEqual(token_card['proposals'][0]['payment_verification_status'], Proposal.BAD_MEMO)
+
+    def test_draft_awaiting_verification_serializes_as_pending(self):
+        """`Proposal.payment_verification_status` masks the payment status of a
+        draft that is waiting on submission. The endpoint filters drafts out, so
+        the PENDING arm is only reachable through the card serializer itself.
+        """
+        pending_draft = make_asset_proposal(
+            title='Draft ADD',
+            draft=True,
+            action=Proposal.TO_SUBMIT,
+        )
+        submitted = make_asset_proposal(
+            title='Submitted ADD',
+            action=Proposal.TO_SUBMIT,
+        )
+
+        self.assertEqual(
+            AssetTokenProposalSerializer(pending_draft).data['payment_verification_status'],
+            'PENDING',
+        )
+        # Same pending action, already published: the raw payment status survives.
+        self.assertEqual(
+            AssetTokenProposalSerializer(submitted).data['payment_verification_status'],
+            Proposal.FINE,
+        )
 
     def test_executed_token_ordered_above_unexecuted_token(self):
         """X6 regression: `.order_by('-last_execution_at')` on Postgres defaults
