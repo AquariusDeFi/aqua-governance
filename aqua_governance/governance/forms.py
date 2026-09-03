@@ -3,6 +3,8 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
+from django_quill.quill import Quill
+
 from aqua_governance.governance.asset_payload import validate_asset_payload
 from aqua_governance.governance.asset_tokens import find_active_asset_proposal_conflict
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
@@ -11,7 +13,8 @@ from aqua_governance.governance.models import Proposal
 from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
 from aqua_governance.governance.proposal_queue_slots import is_queue_slot_available
 from aqua_governance.governance.serializers_v2 import ASSET_FIELDS, ASSET_REQUIRED_TEXT_FIELDS
-from aqua_governance.utils.payments import check_transaction_xdr
+from aqua_governance.utils.memo import PURPOSE_CREATE, build_memo_expectation
+from aqua_governance.utils.payments import inspect_envelope
 from aqua_governance.utils.widgets import CustomQuillWidget
 
 
@@ -25,6 +28,38 @@ ADMIN_OPTIONAL_FIELDS = (
 
 def _value_is_blank(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _canonical_transaction_hash(value):
+    """Lowercase a hand-typed hash the way every other write path already does.
+
+    Uppercase hex names the same transaction, but the ledger and the promotion guard both
+    key on the canonical string, so an admin-typed ``AB12…`` would be retired as a
+    malformed hash before Horizon was ever asked about it.
+    """
+    if not isinstance(value, str):
+        return value
+    return value.strip().lower()
+
+
+def _quill_html(value):
+    """The HTML of a proposal text, whichever shape the admin hands over.
+
+    ``QuillFormField`` is a plain ``CharField``, so a submitted value arrives as the raw
+    Quill JSON string, while an instance fallback arrives as a ``FieldQuill``.  A value that
+    is neither degrades the memo expectation rather than raising out of ``clean()``.
+    """
+    if value is None:
+        return None
+
+    html = getattr(value, 'html', None)
+    if html is not None:
+        return html
+
+    try:
+        return Quill(value).html
+    except Exception:
+        return None
 
 
 class ProposalAdminForm(forms.ModelForm):
@@ -59,6 +94,12 @@ class ProposalAdminForm(forms.ModelForm):
     class Meta:
         model = Proposal
         fields = forms.ALL_FIELDS
+
+    def clean_transaction_hash(self):
+        return _canonical_transaction_hash(self.cleaned_data.get('transaction_hash'))
+
+    def clean_new_transaction_hash(self):
+        return _canonical_transaction_hash(self.cleaned_data.get('new_transaction_hash'))
 
     def _is_asset_manager(self) -> bool:
         request_user = getattr(self, 'request_user', None)
@@ -226,12 +267,34 @@ class ProposalAdminForm(forms.ModelForm):
                 cleaned_data['end_at'] = None
 
         if not is_asset_proposal and cleaned_data.get('envelope_xdr'):
-            payment_status = check_transaction_xdr(cleaned_data, settings.PROPOSAL_CREATE_OR_UPDATE_COST)
+            payment_status = self._inspect_general_payment_envelope(cleaned_data)
             self.instance.payment_status = payment_status
             if self.instance._state.adding and payment_status != Proposal.FINE:
                 self.instance.hide = True
 
         return cleaned_data
+
+    def _inspect_general_payment_envelope(self, cleaned_data):
+        """Advisory read of the admin-supplied envelope against the CREATE memo.
+
+        Unsigned and client-supplied like every other envelope, so ``FINE`` here is a hint;
+        the promotion path is what authorizes anything.  The trigger condition is unchanged
+        in v1, so an admin *editing* an existing proposal is still scored against a create
+        memo it was never going to carry.
+        """
+        proposed_by = self._cleaned_or_instance_value(cleaned_data, 'proposed_by')
+        return inspect_envelope(
+            envelope_xdr=cleaned_data['envelope_xdr'],
+            expected_payer=proposed_by,
+            memo_expectation=build_memo_expectation(
+                PURPOSE_CREATE,
+                proposed_by=proposed_by,
+                proposal_type=self._cleaned_or_instance_value(cleaned_data, 'proposal_type'),
+                title=self._cleaned_or_instance_value(cleaned_data, 'title'),
+                text_html=_quill_html(self._cleaned_or_instance_value(cleaned_data, 'text')),
+            ),
+            payment_amount=settings.PROPOSAL_CREATE_OR_UPDATE_COST,
+        )
 
     @staticmethod
     def _validate_general_payment_fields(cleaned_data):

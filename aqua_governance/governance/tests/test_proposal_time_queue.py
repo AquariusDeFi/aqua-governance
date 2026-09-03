@@ -17,6 +17,7 @@ from aqua_governance.governance.tests._factories import (
     make_asset_proposal_raw,
     patch_ice_circulating_supply,
 )
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verifies
 
 
 class ProposalTimeQueueTests(TestCase):
@@ -181,8 +182,8 @@ class ProposalTimeQueueTests(TestCase):
 
         self.assertTrue(serializer.is_valid(), serializer.errors)
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_check_transaction_keeps_paid_submit_when_slot_conflicts(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_check_transaction_keeps_paid_submit_when_slot_conflicts(self, _mock_verify_payment):
         start_at, end_at = self._queue_slot(weeks_ahead=1)
         ProposalQueueSlot.objects.create(
             proposal=self._create_proposal(
@@ -219,8 +220,8 @@ class ProposalTimeQueueTests(TestCase):
         self.assertEqual(proposal.new_envelope_xdr, 'target-xdr')
         self.assertEqual(proposal.new_transaction_hash, 'a' * 64)
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_check_transaction_books_future_slot_as_queued(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_check_transaction_books_future_slot_as_queued(self, _mock_verify_payment):
         start_at, end_at = self._queue_slot(weeks_ahead=1)
         proposal = self._create_proposal(
             proposal_type=Proposal.PROPOSAL_TYPE_GENERAL,
@@ -242,7 +243,7 @@ class ProposalTimeQueueTests(TestCase):
         self.assertEqual(proposal.end_at, end_at)
         self.assertTrue(ProposalQueueSlot.objects.filter(proposal=proposal, start_at=start_at, end_at=end_at).exists())
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     @patch('aqua_governance.governance.serializers_v2.acquire_proposal_transition_lock')
     def test_submit_serializer_uses_global_transition_lock_for_general_proposal(
         self,
@@ -547,8 +548,8 @@ class ProposalTimeQueueTests(TestCase):
         mock_update_results.assert_not_called()
 
     @patch('aqua_governance.governance.proposal_transactions._alert_operator')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_late_submit_payment_keeps_to_submit_when_window_is_no_longer_valid(self, _mock_check_status, mock_alert):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_late_submit_payment_keeps_to_submit_when_window_is_no_longer_valid(self, _mock_verify_payment, mock_alert):
         proposal = self._create_proposal(
             action=Proposal.TO_SUBMIT,
             new_start_at=timezone.now() - timedelta(days=8),
@@ -569,7 +570,7 @@ class ProposalTimeQueueTests(TestCase):
         mock_alert.assert_called_once()
 
 
-@patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.HORIZON_ERROR)
+@patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.HORIZON_ERROR)
 class AssetProposalCreateWithoutQueueBookingTests(TestCase):
     def setUp(self):
         super().setUp()

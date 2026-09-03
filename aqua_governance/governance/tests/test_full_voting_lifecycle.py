@@ -15,6 +15,7 @@ from aqua_governance.governance.tests._factories import (
     TERTIARY_ACCOUNT,
     patch_ice_circulating_supply,
 )
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verifies
 
 
 FIXED_NOW = datetime(2024, 1, 10, 12, 0, tzinfo=datetime_timezone.utc)
@@ -139,13 +140,13 @@ class FullVotingLifecycleTests(TestCase):
             'created_at': _iso_z(created_at),
         }
 
-    @patch('aqua_governance.governance.views.ProposalViewSet._check_owner_permissions')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch')
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_general_proposal_full_queue_vote_and_finalize_with_fake_horizon_votes_and_mocked_payment_checks(
         self,
         _mock_check_xdr,
-        _mock_check_status,
+        _mock_verify_payment,
         _mock_owner_permissions,
     ):
         """Payment/XDR/ownership checks are mocked here; dedicated tests cover real validation paths."""

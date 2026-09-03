@@ -225,6 +225,7 @@ ICE_CIRCULATING_URL = env('ICE_CIRCULATING_URL', default='https://ice-distributo
 PROPOSAL_COST = env.int('PROPOSAL_COST', default=1000000)  # TODO: remove it
 PROPOSAL_SUBMIT_COST = env.int('PROPOSAL_SUBMIT_COST', default=900000)
 PROPOSAL_CREATE_OR_UPDATE_COST = env.int('PROPOSAL_CREATE_OR_UPDATE_COST', default=100000)
+PROPOSAL_LEGACY_MEMO_ACCEPTED = env.bool('PROPOSAL_LEGACY_MEMO_ACCEPTED', default=True)
 
 EXPIRED_TIME = timedelta(days=env.int('EXPIRED_TIME_DAYS', default=30))
 DISCUSSION_TIME = timedelta(days=env.int('DISCUSSION_TIME_DAYS', default=7))
@@ -244,6 +245,9 @@ ASSET_PROPOSAL_TRANSITION_ADVISORY_LOCK_ID = env.int(
     'ASSET_PROPOSAL_TRANSITION_ADVISORY_LOCK_ID',
     default=env.int('ASSET_SUBMIT_ADVISORY_LOCK_ID', default=94127051),
 )
+# Distinct from the transition lock: the payment sweep holds it for its whole run, and
+# sharing an id would block every staging and promotion for that duration.
+PROPOSAL_PAYMENT_SWEEP_ADVISORY_LOCK_ID = env.int('PROPOSAL_PAYMENT_SWEEP_ADVISORY_LOCK_ID', default=94127052)
 ONCHAIN_SOROBAN_BASE_FEE = env.int('ONCHAIN_SOROBAN_BASE_FEE', default=100000)
 ONCHAIN_SOROBAN_TIMEOUT = env.int('ONCHAIN_SOROBAN_TIMEOUT', default=120)
 ONCHAIN_EXECUTION_LEASE_SECONDS = env.int('ONCHAIN_EXECUTION_LEASE_SECONDS', default=300)

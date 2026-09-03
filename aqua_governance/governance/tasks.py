@@ -4,13 +4,17 @@ from typing import Optional
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
 from stellar_sdk import Server
 from stellar_sdk.soroban_rpc import GetTransactionStatus
 
 from aqua_governance.governance import proposal_transactions
-from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
+from aqua_governance.governance.db_locks import (
+    _release_payment_sweep_lock,
+    _try_acquire_payment_sweep_lock,
+    acquire_proposal_transition_lock,
+)
 from aqua_governance.governance.models import AssetToken, Proposal, ProposalQueueSlot
 from aqua_governance.governance.onchain_hooks import execute_onchain_action
 from aqua_governance.governance.onchain_hooks.soroban import get_soroban_transaction
@@ -149,11 +153,45 @@ def task_check_expired_proposals():
 
 @celery_app.task(ignore_result=True)
 def task_check_pending_proposal_payments():
-    proposals = Proposal.objects.filter(
-        hide=False,
-    ).exclude(action=Proposal.NONE)
-    for proposal in proposals:
-        proposal_transactions.check_transaction(proposal)
+    if not _try_acquire_payment_sweep_lock():
+        logger.info('Payment sweep already running; skipping this tick.')
+        return
+
+    try:
+        # A row whose pending hash is the one already terminally rejected can never
+        # resolve differently, so it is filtered out in SQL rather than re-asked of
+        # Horizon every minute.  The F comparison is NULL for a row that was never
+        # rejected, and Django's NOT (...) keeps such a row in the sweep.
+        proposals = (
+            Proposal.objects.filter(hide=False)
+            .exclude(action=Proposal.NONE)
+            .exclude(
+                action=Proposal.TO_CREATE,
+                transaction_hash=F('payment_check_rejected_hash'),
+            )
+            .exclude(
+                ~Q(action=Proposal.TO_CREATE),
+                new_transaction_hash=F('payment_check_rejected_hash'),
+            )
+            .order_by('id')
+        )
+        for proposal in proposals:
+            try:
+                proposal_transactions.check_transaction(proposal)
+            except Exception:
+                # One unconfirmable row must not stop the rows queued behind it: a
+                # rejected claim, a deadlock and every programming error now reach
+                # here, where the old blanket catch in payments.py used to hide them.
+                logger.exception(
+                    'Pending payment check failed.',
+                    extra={'proposal_id': proposal.id},
+                )
+    finally:
+        if not _release_payment_sweep_lock():
+            # A session-level lock the release did not own stays held for the life of that
+            # database session, and every later tick then logs the benign-looking overlap
+            # line instead.  Say so once, loudly, so the two states are distinguishable.
+            logger.warning('Payment sweep advisory lock was not released; later ticks may be skipped.')
 
 
 @celery_app.task(ignore_result=True)
