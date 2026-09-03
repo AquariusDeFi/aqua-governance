@@ -13,7 +13,6 @@ from rest_framework import status
 from rest_framework.filters import OrderingFilter
 from rest_framework.mixins import CreateModelMixin, ListModelMixin, RetrieveModelMixin, UpdateModelMixin
 from rest_framework.permissions import AllowAny
-from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import GenericViewSet
 from stellar_sdk import TransactionEnvelope
 
@@ -187,12 +186,6 @@ class ProposalViewSet(
 
         if transaction_envelope.transaction.source.account_id != proposal.proposed_by:
             raise PermissionDenied(detail="You are not the proposal owner")
-
-    def get_throttles(self):
-        if self.action == "check_proposal_payment":
-            self.throttle_scope = "proposal_payment_check"
-            return [ScopedRateThrottle()]
-        return super().get_throttles()
 
     def perform_update(self, serializer):
         instance = self.get_object()

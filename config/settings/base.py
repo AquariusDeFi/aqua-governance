@@ -174,19 +174,12 @@ if CELERY_ENABLED:
 # http://www.django-rest-framework.org/api-guide/settings/
 # --------------------------------------------------------------------------
 
-# An empty rate disables throttling.  Any rate is multiplied by the worker count until
-# CACHES['default'] points at a shared backend, so this bounds load, not abuse.
-PROPOSAL_PAYMENT_CHECK_THROTTLE_RATE = env('PROPOSAL_PAYMENT_CHECK_THROTTLE_RATE', default='')
-
 REST_FRAMEWORK = {
     'PAGE_SIZE': 30,
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],
-    'DEFAULT_THROTTLE_RATES': {
-        'proposal_payment_check': PROPOSAL_PAYMENT_CHECK_THROTTLE_RATE or None,
-    },
 }
 
 # CORS headers settings
