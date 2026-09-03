@@ -18,7 +18,15 @@ from aqua_governance.governance.tests._factories import (
     distinct_hash,
     make_general_proposal,
 )
-from aqua_governance.governance.tests._promotions import ALERT, CHECK_STATUS, PromotionTestCase, fine, make, quill
+from aqua_governance.governance.tests._promotions import (
+    ALERT,
+    VERIFY_PAYMENT,
+    PromotionTestCase,
+    fine,
+    make,
+    quill,
+    verifies,
+)
 
 
 CLAIM_LOGGER = 'aqua_governance.governance.consumed_transactions'
@@ -366,13 +374,14 @@ class PromotionClaimTests(PromotionTestCase):
                 proposal = build(101)
                 paid_hash = proposal.transaction_hash if label == 'create' else proposal.new_transaction_hash
 
-                with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+                with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
                     proposal_transactions.check_transaction(proposal)
 
                 row = ConsumedTransaction.objects.get()
                 self.assertEqual(row.transaction_hash, paid_hash)
                 self.assertEqual(row.purpose, purpose)
                 self.assertEqual(row.proposal_id, proposal.id)
+                self.assertEqual(row.payer, DEFAULT_PROPOSED_BY)
 
     @patch('aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch')
     @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
@@ -430,7 +439,7 @@ class PromotionClaimTests(PromotionTestCase):
                 proposal = self.pending_update(121)
 
                 with patch(ALERT):
-                    with patch(CHECK_STATUS, return_value=status):
+                    with patch(VERIFY_PAYMENT, side_effect=verifies(status)):
                         proposal_transactions.check_transaction(proposal)
 
                 self.assertEqual(ConsumedTransaction.objects.count(), 0)
@@ -452,7 +461,7 @@ class PromotionClaimTests(PromotionTestCase):
             proposal = self.pending_update(index)
             paid_hash = proposal.new_transaction_hash
 
-        with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
             proposal_transactions.check_transaction(proposal)
 
         displacing_hash = distinct_hash(index + 3)
@@ -463,7 +472,7 @@ class PromotionClaimTests(PromotionTestCase):
             new_transaction_hash=displacing_hash,
         )
         proposal.refresh_from_db()
-        with patch(CHECK_STATUS, return_value=fine(displacing_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(displacing_hash)):
             proposal_transactions.check_transaction(proposal)
 
         self.assertFalse(Proposal.objects.filter(transaction_hash=paid_hash).exists())
@@ -474,7 +483,7 @@ class PromotionClaimTests(PromotionTestCase):
         replay = self.pending_create(139, transaction_hash=creation_hash)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, return_value=fine(creation_hash)):
+            with patch(VERIFY_PAYMENT, return_value=fine(creation_hash)):
                 result = proposal_transactions.check_transaction(replay)
 
         self.assertEqual(result['outcome'], 'transaction_already_consumed')
@@ -493,7 +502,7 @@ class PromotionClaimTests(PromotionTestCase):
         replay = self.pending_update(149, new_transaction_hash=paid_hash)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+            with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
                 first = proposal_transactions.check_transaction(replay)
                 repeat = proposal_transactions.check_transaction(replay)
 
@@ -516,7 +525,7 @@ class PromotionClaimTests(PromotionTestCase):
         replay = self.pending_submit(159, new_transaction_hash=paid_hash)
 
         with patch(ALERT):
-            with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+            with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
                 result = proposal_transactions.check_transaction(replay)
 
         self.assertEqual(result['outcome'], 'transaction_already_consumed')

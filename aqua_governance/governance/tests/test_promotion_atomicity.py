@@ -16,12 +16,14 @@ from aqua_governance.governance.models import ConsumedTransaction, HistoryPropos
 from aqua_governance.governance.tests._factories import DEFAULT_PROPOSED_BY, distinct_hash, make_asset_proposal_raw
 from aqua_governance.governance.tests._promotions import (
     ALERT,
-    CHECK_STATUS,
     CLAIM,
     DEFAULT_TITLE,
+    VERIFY_PAYMENT,
     PromotionTestCase,
     competing_claim_then_delegate,
     fine,
+    verdict,
+    verifies,
 )
 from aqua_governance.governance.transitions import UpdateTransition
 
@@ -31,7 +33,7 @@ class PromotionAtomicityTests(PromotionTestCase):
     def test_a_failed_update_promotion_leaves_no_orphan_history_row(self):
         proposal = self.pending_update(1)
 
-        with patch(CHECK_STATUS, return_value=fine(proposal.new_transaction_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(proposal.new_transaction_hash)):
             with patch.object(Proposal, 'save', side_effect=RuntimeError('write failed')):
                 with self.assertRaises(RuntimeError):
                     proposal_transactions.check_transaction(proposal)
@@ -47,7 +49,7 @@ class PromotionAtomicityTests(PromotionTestCase):
         proposal = self.pending_update(3)
         paid_hash = proposal.new_transaction_hash
 
-        with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'updated')
@@ -66,7 +68,7 @@ class PromotionAtomicityTests(PromotionTestCase):
     def test_an_update_promotion_clears_the_staged_columns_it_consumed(self):
         proposal = self.pending_update(5)
 
-        with patch(CHECK_STATUS, return_value=fine(proposal.new_transaction_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(proposal.new_transaction_hash)):
             proposal_transactions.check_transaction(proposal)
 
         proposal.refresh_from_db()
@@ -80,7 +82,7 @@ class PromotionAtomicityTests(PromotionTestCase):
     def test_a_claim_that_raises_rolls_the_whole_update_back(self):
         proposal = self.pending_update(7)
 
-        with patch(CHECK_STATUS, return_value=fine(proposal.new_transaction_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(proposal.new_transaction_hash)):
             with patch(CLAIM, side_effect=RuntimeError('ledger unavailable')):
                 with self.assertRaises(RuntimeError):
                     proposal_transactions.check_transaction(proposal)
@@ -94,7 +96,7 @@ class PromotionAtomicityTests(PromotionTestCase):
     def test_a_general_create_commits_its_claim_and_its_state_change_together(self):
         proposal = self.pending_create(9)
 
-        with patch(CHECK_STATUS, return_value=fine(proposal.transaction_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(proposal.transaction_hash)):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'created')
@@ -109,7 +111,7 @@ class PromotionAtomicityTests(PromotionTestCase):
     def test_a_claim_that_raises_rolls_the_whole_general_create_back(self):
         proposal = self.pending_create(10)
 
-        with patch(CHECK_STATUS, return_value=fine(proposal.transaction_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(proposal.transaction_hash)):
             with patch(CLAIM, side_effect=RuntimeError('ledger unavailable')):
                 with self.assertRaises(RuntimeError):
                     proposal_transactions.check_transaction(proposal)
@@ -123,7 +125,7 @@ class PromotionAtomicityTests(PromotionTestCase):
         proposal = self.pending_submit(11)
         paid_hash = proposal.new_transaction_hash
 
-        with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'booked')
@@ -137,7 +139,7 @@ class PromotionAtomicityTests(PromotionTestCase):
     def test_a_claim_that_raises_rolls_back_the_booking_as_well(self):
         proposal = self.pending_submit(13)
 
-        with patch(CHECK_STATUS, return_value=fine(proposal.new_transaction_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(proposal.new_transaction_hash)):
             with patch(CLAIM, side_effect=RuntimeError('ledger unavailable')):
                 with self.assertRaises(RuntimeError):
                     proposal_transactions.check_transaction(proposal)
@@ -154,7 +156,7 @@ class PromotionAtomicityTests(PromotionTestCase):
         proposal = self.pending_update(15)
         paid_hash = proposal.new_transaction_hash
 
-        with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
             with patch(CLAIM, side_effect=competing_claim_then_delegate(paid_hash)):
                 response = self.client.post(
                     '/api/proposal/{0}/check_payment/'.format(proposal.id), {}, format='json')
@@ -171,7 +173,7 @@ class PromotionAtomicityTests(PromotionTestCase):
         proposal = self.pending_submit(17)
         paid_hash = proposal.new_transaction_hash
 
-        with patch(CHECK_STATUS, return_value=fine(paid_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(paid_hash)):
             with patch(CLAIM, side_effect=competing_claim_then_delegate(paid_hash)):
                 result = proposal_transactions.check_transaction(proposal)
 
@@ -189,7 +191,7 @@ class PromotionAtomicityTests(PromotionTestCase):
         proposal = self.pending_update(19)
         stale = Proposal.objects.get(id=proposal.id)
 
-        with patch(CHECK_STATUS, return_value=fine(proposal.new_transaction_hash)):
+        with patch(VERIFY_PAYMENT, return_value=fine(proposal.new_transaction_hash)):
             first = proposal_transactions.check_transaction(proposal)
             second = proposal_transactions.check_transaction(stale)
 
@@ -205,7 +207,7 @@ class PromotionAtomicityTests(PromotionTestCase):
         inner_hash = proposal.new_transaction_hash
         outer_hash = distinct_hash(23)
 
-        with patch(CHECK_STATUS, return_value=fine(inner_hash, resolved_hashes=(inner_hash, outer_hash))):
+        with patch(VERIFY_PAYMENT, return_value=fine(inner_hash, resolved_hashes=(inner_hash, outer_hash))):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'updated')
@@ -225,9 +227,9 @@ class TerminalWriteGuardTests(PromotionTestCase):
     """
 
     def _verdict_after_the_row_moves_on(self, proposal, status):
-        def _answer(**kwargs):
+        def _answer(*, transaction_hash, **kwargs):
             Proposal.objects.filter(id=proposal.id).update(action=Proposal.NONE)
-            return status
+            return verdict(status, transaction_hash)
 
         return _answer
 
@@ -235,7 +237,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_update(31)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, side_effect=self._verdict_after_the_row_moves_on(
+            with patch(VERIFY_PAYMENT, side_effect=self._verdict_after_the_row_moves_on(
                     proposal, Proposal.BAD_MEMO)):
                 result = proposal_transactions.check_transaction(proposal)
 
@@ -249,7 +251,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_create(33)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, side_effect=self._verdict_after_the_row_moves_on(
+            with patch(VERIFY_PAYMENT, side_effect=self._verdict_after_the_row_moves_on(
                     proposal, Proposal.INVALID_PAYMENT)):
                 result = proposal_transactions.check_transaction(proposal)
 
@@ -264,7 +266,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_update(35)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, return_value=Proposal.BAD_MEMO):
+            with patch(VERIFY_PAYMENT, return_value=verdict(Proposal.BAD_MEMO, proposal.new_transaction_hash)):
                 result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'payment_rejected')
@@ -279,7 +281,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_create(37)
 
         with patch(ALERT):
-            with patch(CHECK_STATUS, return_value=Proposal.BAD_MEMO):
+            with patch(VERIFY_PAYMENT, return_value=verdict(Proposal.BAD_MEMO, proposal.transaction_hash)):
                 result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'payment_rejected')
@@ -293,7 +295,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_update(39)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, return_value=Proposal.BAD_MEMO):
+            with patch(VERIFY_PAYMENT, return_value=verdict(Proposal.BAD_MEMO, proposal.new_transaction_hash)):
                 proposal_transactions.check_transaction(proposal)
                 repeat = proposal_transactions.check_transaction(proposal)
 
@@ -304,7 +306,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_update(41)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, return_value=Proposal.BAD_MEMO):
+            with patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.BAD_MEMO)):
                 proposal_transactions.check_transaction(proposal)
                 Proposal.objects.filter(id=proposal.id).update(new_transaction_hash=distinct_hash(43))
                 proposal.refresh_from_db()
@@ -324,7 +326,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         self.assertEqual(proposal.payment_status, Proposal.FINE)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, return_value=Proposal.BAD_MEMO):
+            with patch(VERIFY_PAYMENT, return_value=verdict(Proposal.BAD_MEMO, proposal.new_transaction_hash)):
                 result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'skipped')
@@ -349,7 +351,7 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_update(45)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS, return_value=Proposal.HORIZON_ERROR):
+            with patch(VERIFY_PAYMENT, return_value=verdict(Proposal.HORIZON_ERROR, proposal.new_transaction_hash)):
                 result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'payment_not_confirmed')
@@ -363,10 +365,10 @@ class TerminalWriteGuardTests(PromotionTestCase):
         proposal = self.pending_update(47, new_transaction_hash='z' * 64)
 
         with patch(ALERT) as mock_alert:
-            with patch(CHECK_STATUS) as mock_check_status:
+            with patch(VERIFY_PAYMENT) as mock_verify_payment:
                 result = proposal_transactions.check_transaction(proposal)
 
-        mock_check_status.assert_not_called()
+        mock_verify_payment.assert_not_called()
         mock_alert.assert_called_once()
         self.assertEqual(result['outcome'], 'payment_rejected')
         proposal.refresh_from_db()
@@ -385,7 +387,7 @@ class StaleTransitionGuardTests(PromotionTestCase):
             Proposal.objects.filter(id=proposal.id).update(new_title='Substituted title')
             return fine(distinct_hash(52))
 
-        with patch(CHECK_STATUS, side_effect=_answer_then_restage):
+        with patch(VERIFY_PAYMENT, side_effect=_answer_then_restage):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'stale_transition')
@@ -409,7 +411,7 @@ class StaleTransitionGuardTests(PromotionTestCase):
             )
             return fine(distinct_hash(54))
 
-        with patch(CHECK_STATUS, side_effect=_answer_then_restage):
+        with patch(VERIFY_PAYMENT, side_effect=_answer_then_restage):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'stale_transition')
@@ -426,7 +428,7 @@ class StaleTransitionGuardTests(PromotionTestCase):
             Proposal.objects.filter(id=proposal.id).update(transaction_hash=distinct_hash(56))
             return fine(distinct_hash(55))
 
-        with patch(CHECK_STATUS, side_effect=_answer_then_restage):
+        with patch(VERIFY_PAYMENT, side_effect=_answer_then_restage):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'stale_transition')
@@ -450,7 +452,7 @@ class StaleTransitionGuardTests(PromotionTestCase):
             Proposal.objects.filter(id=proposal.id).update(transaction_hash=distinct_hash(58))
             return fine(distinct_hash(57))
 
-        with patch(CHECK_STATUS, side_effect=_answer_then_restage):
+        with patch(VERIFY_PAYMENT, side_effect=_answer_then_restage):
             result = proposal_transactions.check_transaction(proposal)
 
         self.assertEqual(result['outcome'], 'stale_transition')

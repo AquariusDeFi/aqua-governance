@@ -1,7 +1,7 @@
 """The composition proof: what authorizes a proposal transition is the payment, nothing else.
 
 Every case here drives the real API against real, offline-built envelopes settled on a fake
-Horizon.  ``check_proposal_status`` is never patched, and neither is the declared-owner
+Horizon.  ``verify_payment`` is never patched, and neither is the declared-owner
 check - each attack supplies an envelope whose ``source`` names the victim, which is exactly
 the input that check used to treat as proof of ownership.  A test that mocked either would
 prove nothing about the composition.

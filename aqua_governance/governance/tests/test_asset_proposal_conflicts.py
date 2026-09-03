@@ -19,6 +19,7 @@ from aqua_governance.governance.tests._factories import (
     make_asset_proposal_raw,
     patch_ice_circulating_supply,
 )
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verifies
 
 
 class AssetProposalConflictTests(TestCase):
@@ -225,8 +226,8 @@ class AssetProposalConflictTests(TestCase):
 
                 self.assertEqual(response.status_code, 201)
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_confirmed_create_payment_keeps_asset_proposal_pending_while_conflict_exists(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_confirmed_create_payment_keeps_asset_proposal_pending_while_conflict_exists(self, _mock_verify_payment):
         blocker = self._create_asset_proposal(
             transaction_hash='6' * 64,
             proposal_status=Proposal.QUEUED,
@@ -314,8 +315,11 @@ class AssetProposalConflictTests(TestCase):
         self.assertIsNone(proposal.new_end_at)
         self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_check_payment_returns_409_for_active_same_asset_conflict_and_does_not_book_slot(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_check_payment_returns_409_for_active_same_asset_conflict_and_does_not_book_slot(
+        self,
+        _mock_verify_payment,
+    ):
         blocker = self._create_asset_proposal(
             transaction_hash='d' * 64,
             proposal_status=Proposal.VOTING,

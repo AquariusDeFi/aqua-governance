@@ -46,7 +46,7 @@ from aqua_governance.governance.proposal_constants import (
 from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
 from aqua_governance.governance.proposal_queue_slots import find_queue_slot_conflict, sync_proposal_queue_slot
 from aqua_governance.governance.transitions import CreateTransition, SubmitTransition, UpdateTransition
-from aqua_governance.utils.payments import PaymentCheckResult, verify_payment
+from aqua_governance.utils.payments import verify_payment
 
 
 logger = logging.getLogger(__name__)
@@ -83,26 +83,14 @@ def _alert_operator(message, extra=None):
             sentry_sdk.capture_message(message, level='error')
 
 
-def check_proposal_status(**kwargs):
-    """Thin named wrapper so existing tests can keep patching this symbol."""
-    return verify_payment(**kwargs)
-
-
-def _coerce_payment_result(value):
-    """Tolerate a bare status string from a test mock."""
-    if isinstance(value, str):
-        return PaymentCheckResult(payment_status=value, reason='mocked')
-    return value
-
-
 def _verify(proposal, *, transaction_hash, memo_expectation, payment_amount):
-    return _coerce_payment_result(check_proposal_status(
+    return verify_payment(
         transaction_hash=transaction_hash,
         expected_payer=proposal.proposed_by,
         memo_expectation=memo_expectation,
         payment_amount=payment_amount,
         log_context={'proposal_id': proposal.id},
-    ))
+    )
 
 
 def _invalid_transaction_hash_reason(value):
@@ -162,7 +150,12 @@ def _terminal_create_fields(proposal, expected_action):
 
 
 def _claim_hashes(result, transaction_hash):
-    """Every hash the payment resolves under, or the requested one if Horizon was mocked."""
+    """Every hash the payment resolves under, or the requested one if none were resolved.
+
+    Only the local dev bypass returns ``FINE`` without asking Horizon, and it resolves no
+    hashes; the transition still has to burn the one it presented, or the bypass would hand
+    a developer an unlimited payment.
+    """
     return result.resolved_hashes or (transaction_hash,)
 
 

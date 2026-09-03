@@ -19,6 +19,7 @@ from aqua_governance.governance.tests._factories import (
     SECONDARY_ACCOUNT,
     patch_ice_circulating_supply,
 )
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verifies
 from aqua_governance.taskapp import app as celery_app
 
 
@@ -144,8 +145,8 @@ class AssetProposalActivationTests(TestCase):
             celery_app.conf.beat_schedule,
         )
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_queued_asset_proposal_refreshes_last_updated_at_on_activation(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_queued_asset_proposal_refreshes_last_updated_at_on_activation(self, _mock_verify_payment):
         blocker = self._create_proposal()
         queued = self._create_proposal(
             transaction_hash='b' * 64,

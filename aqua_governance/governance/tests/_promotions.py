@@ -24,14 +24,30 @@ from aqua_governance.governance.tests._factories import (
     patch_ice_circulating_supply,
 )
 from aqua_governance.utils.memo import MEMO_FORMAT_CANONICAL
-from aqua_governance.utils.payments import PaymentCheckResult
+from aqua_governance.utils.payments import (
+    REASON_MEMO_MISMATCH,
+    REASON_NO_MATCHING_PAYMENT,
+    REASON_OK,
+    REASON_TRANSACTION_FAILED,
+    REASON_TRANSACTION_NOT_FOUND,
+    PaymentCheckResult,
+)
 
 
-CHECK_STATUS = 'aqua_governance.governance.proposal_transactions.check_proposal_status'
+VERIFY_PAYMENT = 'aqua_governance.governance.proposal_transactions.verify_payment'
 CLAIM = 'aqua_governance.governance.proposal_transactions.claim_transaction_hashes'
 ALERT = 'aqua_governance.governance.proposal_transactions._alert_operator'
 
 DEFAULT_TITLE = 'Test general proposal'
+
+# The reason ``verify_payment`` reports alongside each non-FINE status.  One per status is
+# enough here: the promotion paths branch on the status, and the reason only reaches logs.
+REASON_FOR_STATUS = {
+    Proposal.HORIZON_ERROR: REASON_TRANSACTION_NOT_FOUND,
+    Proposal.BAD_MEMO: REASON_MEMO_MISMATCH,
+    Proposal.INVALID_PAYMENT: REASON_NO_MATCHING_PAYMENT,
+    Proposal.FAILED_TRANSACTION: REASON_TRANSACTION_FAILED,
+}
 
 
 def quill(html):
@@ -40,15 +56,50 @@ def quill(html):
 
 
 def fine(transaction_hash, *, resolved_hashes=None, payer=DEFAULT_PROPOSED_BY):
-    """The verdict Horizon produces for a payment that authorizes the transition."""
+    """The verdict Horizon produces for a payment that authorizes the transition.
+
+    ``amount`` is left unset: production fills it with the cost the caller asked for, which
+    differs between a creation and a publication, and no promotion path reads it back.
+    """
     return PaymentCheckResult(
         payment_status=Proposal.FINE,
-        reason='ok',
+        reason=REASON_OK,
         transaction_hash=transaction_hash,
         resolved_hashes=resolved_hashes if resolved_hashes is not None else (transaction_hash,),
         payer=payer,
         memo_format=MEMO_FORMAT_CANONICAL,
     )
+
+
+def verdict(payment_status, transaction_hash, *, payer=DEFAULT_PROPOSED_BY):
+    """The verdict ``verify_payment`` builds for ``payment_status`` on this hash.
+
+    A non-FINE verdict authorizes nothing, so it carries neither a payer nor a claimable
+    hash - which is what makes it worth returning rather than a bare status: a promotion
+    path that reached for either on a rejected payment would be caught here.
+    """
+    if payment_status == Proposal.FINE:
+        return fine(transaction_hash, payer=payer)
+
+    return PaymentCheckResult(
+        payment_status=payment_status,
+        reason=REASON_FOR_STATUS[payment_status],
+        transaction_hash=transaction_hash,
+    )
+
+
+def verifies(payment_status=Proposal.FINE):
+    """A ``verify_payment`` stand-in for a flow whose hashes are not known up front.
+
+    Every call is answered about the hash it was actually asked about, bound to the payer
+    it was asked to bind to, so the claim burns the hash the transition really presented.
+    A fixed ``return_value`` cannot do that once one test drives several transitions, or
+    builds its hashes inside the loop that runs them.
+    """
+    def _verify(*, transaction_hash, expected_payer, **kwargs):
+        return verdict(payment_status, transaction_hash, payer=expected_payer)
+
+    return _verify
 
 
 def make(**overrides):

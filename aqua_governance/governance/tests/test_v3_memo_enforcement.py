@@ -1,21 +1,23 @@
-"""What the canonical memo grammar enforces once it is the only grammar accepted.
+"""What the canonical memo grammar enforces when it is the only grammar accepted.
 
 The memo is the part of a payment that says *which* transition was paid for.  The canonical
 grammar commits to the purpose, the proposal, the title, the text and the voting window; the
-pre-v1 grammar committed to the text alone.  Everything the wider grammar adds is asserted
-here, in the state the backend reaches when legacy acceptance is withdrawn - the class
-carries ``PROPOSAL_LEGACY_MEMO_ACCEPTED=False``, which is the one production setting that
-changes.
+pre-v1 grammar committed to the text alone.  What the wider grammar adds is asserted here
+element by element - the proposal id, the title and the voting window - through the same
+endpoints a browser drives, under ``PROPOSAL_LEGACY_MEMO_ACCEPTED=False`` - the single
+production setting that separates this configuration from the deployed one.
 
-Every case is skipped while production still accepts the pre-v1 grammar, because these are
-properties of that later configuration rather than of the one now deployed.  Turning them on
-is deleting the decorators; no assertion below needs rewriting first.  The order of
-operations is the other way round from usual, and deliberately so: the drain criteria are
-checked against production traffic, the flag is flipped, and these tests are what say the
-grammar behaves as designed once it is.
+Three elements are deliberately not isolated here.  The purpose literal is redundant inside
+v1: the three preimages already differ in element count and element shape, so a payment for
+one transition fails another's expectation with or without it, and it is pinned as a wire
+vector in ``test_canonical_memo`` instead.  ``proposed_by`` is unreachable through these
+endpoints, since the payer binding rejects a foreign payer before the memo is compared, and
+``proposal_type`` would need an asset creation, which this module has none of.
+
+Both configurations therefore ship tested: this module pins the narrow grammar, and the
+suites that run under the default setting pin the wide one.  Withdrawing legacy acceptance
+is then flipping the flag, not discovering what the flag does.
 """
-from unittest import skip
-
 from django.test import override_settings
 
 from aqua_governance.governance.models import ConsumedTransaction, Proposal, ProposalQueueSlot
@@ -36,8 +38,6 @@ from aqua_governance.utils.memo import (
     update_memo_payload,
 )
 
-
-SKIP_REASON = 'Asserted once the canonical memo is the only grammar the backend accepts.'
 
 PROPOSAL_TITLE = 'A proposal the owner wrote'
 PROPOSAL_TEXT = '<p>The proposal the owner wrote.</p>'
@@ -121,7 +121,6 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
 
     # -- the grammar itself -----------------------------------------------
 
-    @skip(SKIP_REASON)
     def test_a_payment_carrying_the_pre_v1_memo_no_longer_confirms_a_creation(self):
         """The pre-v1 preimage is the proposal text and nothing else, so it is not accepted."""
         envelope_xdr, transaction_hash = self.burn(
@@ -138,7 +137,6 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
         self.assertTrue(proposal.hide)
         self.assertFalse(ConsumedTransaction.objects.exists())
 
-    @skip(SKIP_REASON)
     def test_the_canonical_create_memo_confirms_a_creation(self):
         proposal = self._confirmed_proposal()
 
@@ -149,7 +147,6 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
             ConsumedTransaction.PURPOSE_CREATE,
         )
 
-    @skip(SKIP_REASON)
     def test_the_canonical_update_memo_confirms_an_update(self):
         proposal = self._confirmed_proposal()
         envelope_xdr, transaction_hash = self.burn(
@@ -172,7 +169,6 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
         self.assertEqual(proposal.title, REVISED_TITLE)
         self.assertEqual(proposal.text.html, REVISED_TEXT)
 
-    @skip(SKIP_REASON)
     def test_the_canonical_submit_memo_books_the_window_it_names(self):
         proposal = self._confirmed_proposal()
         start_at, end_at = self.week()
@@ -196,7 +192,6 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
 
     # -- what the wider preimage closes -----------------------------------
 
-    @skip(SKIP_REASON)
     def test_the_memo_commits_to_the_title_so_a_substituted_title_does_not_confirm(self):
         """The canonical UPDATE preimage carries the title, which the pre-v1 one did not.
 
@@ -225,7 +220,6 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
         self.assertEqual(proposal.payment_status, Proposal.BAD_MEMO)
         self.assertFalse(proposal.history_proposal.exists())
 
-    @skip(SKIP_REASON)
     def test_the_memo_commits_to_the_voting_window_so_a_substituted_window_does_not_confirm(self):
         """The canonical SUBMIT preimage carries both instants, to the second."""
         proposal = self._confirmed_proposal()
@@ -249,7 +243,6 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
         self.assertEqual(proposal.payment_status, Proposal.BAD_MEMO)
         self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
 
-    @skip(SKIP_REASON)
     def test_the_memo_commits_to_the_proposal_so_an_update_payment_does_not_travel(self):
         """The proposal id is in the UPDATE preimage, so the payment names one row only."""
         first = self._confirmed_proposal(title=PROPOSAL_TITLE)
@@ -279,12 +272,14 @@ class CanonicalMemoEnforcementTests(OnChainTestCase):
         self.assertEqual(second.title, 'Another proposal by the same owner')
         self.assertEqual(second.payment_status, Proposal.BAD_MEMO)
 
-    @skip(SKIP_REASON)
-    def test_the_memo_commits_to_the_purpose_so_a_submit_payment_cannot_settle_a_creation(self):
-        """The purpose literal separates the three obligations even at an equal amount.
+    def test_a_submit_memo_cannot_settle_a_creation_even_at_an_equal_amount(self):
+        """A creation is checked against its own preimage, so another obligation's memo misses.
 
-        In the deployed configuration only the amount does, which is why over-payment is
-        refused there; once the purpose is bound, the separation no longer depends on price.
+        The memo here names a publication of an existing proposal, and the expectation the
+        creation builds is over its own title and text, which that memo commits to nothing
+        of.  The amount is the creation price on both sides on purpose: under the pre-v1
+        grammar the memo was the text digest alone and the price was all that kept the three
+        obligations apart, which is why over-payment is refused there.
         """
         existing = self._confirmed_proposal()
         start_at, end_at = self.week()

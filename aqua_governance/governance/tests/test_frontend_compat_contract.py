@@ -28,13 +28,12 @@ from aqua_governance.governance.tests._chain import (
     utc_second_iso,
 )
 from aqua_governance.governance.tests._factories import DEFAULT_CODE, DEFAULT_ISSUER, asset_narratives
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, fine
 from aqua_governance.utils.memo import legacy_memo_digest
 
 
 PROPOSAL_TEXT = '<p>A proposal written in the browser.</p>'
 REVISED_TEXT = '<p>A proposal revised in the browser.</p>'
-
-CHECK_STATUS = 'aqua_governance.governance.proposal_transactions.check_proposal_status'
 
 # Response shapes, frozen.  A key added or removed on any of these is a client-visible
 # change even when every value is unchanged, so the sets are spelled out rather than derived
@@ -397,9 +396,9 @@ class FrontendCompatContractTests(OnChainTestCase):
 
         def restage_underneath(**kwargs):
             Proposal.objects.filter(id=proposal.id).update(new_title='Someone else entirely')
-            return Proposal.FINE
+            return fine(transaction_hash)
 
-        with patch(CHECK_STATUS, side_effect=restage_underneath):
+        with patch(VERIFY_PAYMENT, side_effect=restage_underneath):
             confirmation = self._confirm(proposal)
 
         self.assertEqual(confirmation.status_code, 200, confirmation.data)

@@ -27,6 +27,7 @@ from aqua_governance.governance.tests._horizon import (
     payment_op_record,
     transaction_record,
 )
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verdict, verifies
 from aqua_governance.utils.memo import (
     MEMO_FORMAT_CANONICAL,
     MEMO_FORMAT_LEGACY,
@@ -240,10 +241,10 @@ class ProposalTransactionPaymentAmountTests(TestCase):
         defaults.update(overrides)
         return make_general_proposal(**defaults)
 
-    def _assert_asked_about(self, mock_check_status, *, transaction_hash, purpose, payment_amount):
-        mock_check_status.assert_called_once()
-        self.assertEqual(mock_check_status.call_args.args, ())
-        kwargs = mock_check_status.call_args.kwargs
+    def _assert_asked_about(self, mock_verify_payment, *, transaction_hash, purpose, payment_amount):
+        mock_verify_payment.assert_called_once()
+        self.assertEqual(mock_verify_payment.call_args.args, ())
+        kwargs = mock_verify_payment.call_args.kwargs
         self.assertEqual(kwargs['transaction_hash'], transaction_hash)
         self.assertEqual(kwargs['expected_payer'], DEFAULT_PROPOSED_BY)
         self.assertEqual(kwargs['payment_amount'], payment_amount)
@@ -273,61 +274,49 @@ class ProposalTransactionPaymentAmountTests(TestCase):
         counts = []
 
         with CaptureQueriesContext(connection) as captured:
-            def _verdict(**kwargs):
+            def _verdict(*, transaction_hash, **kwargs):
                 counts.append(len(connection.queries) - captured.initial_queries)
-                return Proposal.BAD_MEMO
+                return verdict(Proposal.BAD_MEMO, transaction_hash)
 
-            with patch(
-                'aqua_governance.governance.proposal_transactions.check_proposal_status',
-                side_effect=_verdict,
-            ):
+            with patch(VERIFY_PAYMENT, side_effect=_verdict):
                 proposal_transactions.check_transaction(proposal)
 
         return counts
 
-    @patch(
-        'aqua_governance.governance.proposal_transactions.check_proposal_status',
-        return_value=Proposal.BAD_MEMO,
-    )
-    def test_create_path_uses_create_or_update_payment_amount(self, mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.BAD_MEMO))
+    def test_create_path_uses_create_or_update_payment_amount(self, mock_verify_payment):
         proposal = self._proposal(action=Proposal.TO_CREATE)
 
         proposal_transactions.check_transaction(proposal)
 
         self._assert_asked_about(
-            mock_check_status,
+            mock_verify_payment,
             transaction_hash=proposal.transaction_hash,
             purpose=PURPOSE_CREATE,
             payment_amount=settings.PROPOSAL_CREATE_OR_UPDATE_COST,
         )
 
-    @patch(
-        'aqua_governance.governance.proposal_transactions.check_proposal_status',
-        return_value=Proposal.BAD_MEMO,
-    )
-    def test_update_path_uses_create_or_update_payment_amount(self, mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.BAD_MEMO))
+    def test_update_path_uses_create_or_update_payment_amount(self, mock_verify_payment):
         proposal = self._proposal(action=Proposal.TO_UPDATE)
 
         proposal_transactions.check_transaction(proposal)
 
         self._assert_asked_about(
-            mock_check_status,
+            mock_verify_payment,
             transaction_hash=proposal.new_transaction_hash,
             purpose=PURPOSE_UPDATE,
             payment_amount=settings.PROPOSAL_CREATE_OR_UPDATE_COST,
         )
 
-    @patch(
-        'aqua_governance.governance.proposal_transactions.check_proposal_status',
-        return_value=Proposal.BAD_MEMO,
-    )
-    def test_submit_path_uses_submit_payment_amount(self, mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.BAD_MEMO))
+    def test_submit_path_uses_submit_payment_amount(self, mock_verify_payment):
         proposal = self._proposal(action=Proposal.TO_SUBMIT)
 
         proposal_transactions.check_transaction(proposal)
 
         self._assert_asked_about(
-            mock_check_status,
+            mock_verify_payment,
             transaction_hash=proposal.new_transaction_hash,
             purpose=PURPOSE_SUBMIT,
             payment_amount=settings.PROPOSAL_SUBMIT_COST,
