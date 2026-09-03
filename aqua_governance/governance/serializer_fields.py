@@ -4,6 +4,8 @@ from rest_framework import serializers
 
 from django_quill.quill import Quill
 
+from aqua_governance.utils.payments import TRANSACTION_HASH_RE
+
 
 # The model column is an unbounded TextField, so this is a denial-of-service bound rather
 # than a column match: every pending proposal's text is hashed into a memo expectation on
@@ -55,7 +57,7 @@ class TransactionHashField(serializers.RegexField):
     def __init__(self, **kwargs):
         kwargs.setdefault('max_length', 64)
         kwargs.setdefault('trim_whitespace', True)
-        super().__init__(r'^[0-9a-fA-F]{64}$', **kwargs)
+        super().__init__(TRANSACTION_HASH_RE.pattern, **kwargs)
         self.error_messages['invalid'] = 'Enter a valid 64-character hexadecimal transaction hash.'
 
     def to_internal_value(self, data):
