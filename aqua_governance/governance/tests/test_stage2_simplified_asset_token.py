@@ -20,7 +20,7 @@ from aqua_governance.governance.asset_tokens import (
 )
 from aqua_governance.governance.models import AssetToken, Proposal
 from aqua_governance.governance.tasks import _sync_asset_token_on_success
-from aqua_governance.governance.tests._factories import patch_ice_circulating_supply
+from aqua_governance.governance.tests._factories import asset_narratives, patch_ice_circulating_supply
 
 
 DEFAULT_PROPOSED_BY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'
@@ -37,22 +37,6 @@ def patch_ice_supply():
     mock_response.status_code = 200
     mock_response.json.return_value = {'ice_supply_amount': 0}
     return patch('aqua_governance.governance.models.requests.get', return_value=mock_response)
-
-
-def asset_narratives():
-    return {
-        'asset_issuer_information': 'info',
-        'asset_token_description': 'desc',
-        'asset_holder_distribution': 'dist',
-        'asset_liquidity': 'liq',
-        'asset_trading_volume': 'vol',
-        'asset_audit_info': 'audit',
-        'asset_stellar_flags': 'flags',
-        'asset_related_projects': 'projects',
-        'asset_community_references': 'refs',
-        'asset_aquarius_traction': 'traction',
-        'asset_issuer_commitments': 'commitments',
-    }
 
 
 def create_proposal(**overrides):

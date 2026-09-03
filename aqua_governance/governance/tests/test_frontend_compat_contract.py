@@ -25,10 +25,9 @@ from aqua_governance.governance.tests._chain import (
     OWNER,
     SUBMIT_COST,
     OnChainTestCase,
-    asset_narratives,
     utc_second_iso,
 )
-from aqua_governance.governance.tests._factories import DEFAULT_CODE, DEFAULT_ISSUER
+from aqua_governance.governance.tests._factories import DEFAULT_CODE, DEFAULT_ISSUER, asset_narratives
 from aqua_governance.utils.memo import legacy_memo_digest
 
 

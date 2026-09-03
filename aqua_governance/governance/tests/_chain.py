@@ -50,22 +50,6 @@ def utc_second_iso(value):
     return value.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
-def asset_narratives():
-    return {
-        'asset_issuer_information': 'info',
-        'asset_token_description': 'desc',
-        'asset_holder_distribution': 'dist',
-        'asset_liquidity': 'liq',
-        'asset_trading_volume': 'vol',
-        'asset_audit_info': 'audit',
-        'asset_stellar_flags': 'flags',
-        'asset_related_projects': 'projects',
-        'asset_community_references': 'refs',
-        'asset_aquarius_traction': 'traction',
-        'asset_issuer_commitments': 'commitments',
-    }
-
-
 class OnChainTestCase(TestCase):
     """A live API against an offline chain, with none of the payment controls patched out."""
 

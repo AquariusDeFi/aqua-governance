@@ -98,7 +98,7 @@ def _quill_text(html='<p>x</p>'):
     return Quill(json.dumps({'delta': {'ops': []}, 'html': html}))
 
 
-def _default_narratives():
+def asset_narratives():
     return {
         'asset_issuer_information': 'info',
         'asset_token_description': 'desc',
@@ -156,7 +156,7 @@ def _asset_fields(
         'asset_code': asset_code,
         'asset_issuer': asset_issuer,
         'asset_contract_address': asset_contract_address,
-        **_default_narratives(),
+        **asset_narratives(),
     }
     if narratives:
         fields.update(narratives)

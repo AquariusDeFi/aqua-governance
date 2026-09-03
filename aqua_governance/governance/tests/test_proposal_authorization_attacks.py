@@ -28,7 +28,6 @@ from aqua_governance.governance.tests._chain import (
     PAYMENTS_LOGGER,
     SUBMIT_COST,
     OnChainTestCase,
-    asset_narratives,
     quill,
     utc_second_iso,
 )
@@ -36,6 +35,7 @@ from aqua_governance.governance.tests._factories import (
     DEFAULT_CODE,
     DEFAULT_ISSUER,
     OWNER_KEYPAIR,
+    asset_narratives,
     distinct_hash,
     make_general_proposal,
 )
