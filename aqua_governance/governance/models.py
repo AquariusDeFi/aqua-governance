@@ -188,6 +188,12 @@ class Proposal(AssetProposalInfo):
     status = models.CharField(choices=PROPOSAL_STATUS_CHOICES, max_length=64, default=FINE)  # TODO: remove
     proposal_status = models.CharField(choices=NEW_PROPOSAL_STATUS_CHOICES, max_length=64, default=DISCUSSION)
     payment_status = models.CharField(choices=PAYMENT_STATUS_CHOICES, max_length=64, default=FINE)
+    # The pending hash that most recently produced a terminal payment rejection for this
+    # proposal.  Deduplicates operator alerts to one per (proposal, hash), and lets the beat
+    # sweep skip the row in SQL instead of re-asking Horizon about it every minute.  Three
+    # things clear it: staging a different hash stops the comparison matching, any staging
+    # write resets it, and so does every promotion.
+    payment_check_rejected_hash = models.CharField(max_length=64, null=True, blank=True)
 
     vote_for_result = models.DecimalField(decimal_places=7, max_digits=20, default=0, blank=True, null=True)
     vote_against_result = models.DecimalField(decimal_places=7, max_digits=20, default=0, blank=True, null=True)
@@ -375,6 +381,44 @@ class ProposalQueueSlot(models.Model):
 
     def __str__(self):
         return f'{self.proposal_id}: {self.start_at.isoformat()} -> {self.end_at.isoformat()}'
+
+
+class ConsumedTransaction(models.Model):
+    """Append-only ledger of Stellar payment transactions already spent on a transition.
+
+    One row per transaction hash, forever.  Written as the last statement of the database
+    transaction that applies the transition, so a hash is burned iff a transition really
+    happened.  Never updated; deleted only by a superuser.
+
+    The primary key is a surrogate ``AutoField`` rather than ``transaction_hash``: with a
+    natural pre-set pk, ``Model.save()`` issues an UPDATE first and silently overwrites an
+    existing claim, while a surrogate pk leaves every fresh instance at ``pk=None`` so a
+    duplicate raises.  Uniqueness is on ``transaction_hash`` alone, because one payment can
+    satisfy two purposes and a composite key would leave that replay open.  The foreign key
+    is ``SET_NULL`` and never ``CASCADE``: superusers can delete proposals, and a cascade
+    would un-burn their payments.
+    """
+
+    PURPOSE_CREATE = proposal_constants.CONSUMED_TRANSACTION_PURPOSE_CREATE
+    PURPOSE_UPDATE = proposal_constants.CONSUMED_TRANSACTION_PURPOSE_UPDATE
+    PURPOSE_SUBMIT = proposal_constants.CONSUMED_TRANSACTION_PURPOSE_SUBMIT
+    PURPOSE_LEGACY = proposal_constants.CONSUMED_TRANSACTION_PURPOSE_LEGACY
+    PURPOSE_CHOICES = proposal_constants.CONSUMED_TRANSACTION_PURPOSE_CHOICES
+
+    transaction_hash = models.CharField(max_length=64, unique=True)
+    proposal = models.ForeignKey(
+        Proposal,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='consumed_transactions',
+    )
+    purpose = models.CharField(choices=PURPOSE_CHOICES, max_length=16)
+    payer = models.CharField(max_length=56, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return '{0} ({1})'.format(self.transaction_hash, self.purpose)
 
 
 class LogVote(models.Model):

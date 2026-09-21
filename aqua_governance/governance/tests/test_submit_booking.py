@@ -14,6 +14,7 @@ from aqua_governance.governance.proposal_queue import get_queue_week_start
 from aqua_governance.governance.proposal_queue_slots import QueueSlotConflict
 from aqua_governance.governance.serializers_v2 import SubmitSerializer
 from aqua_governance.governance.tests._factories import make_asset_proposal_raw, patch_ice_circulating_supply
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verdict, verifies
 
 
 UTC = datetime_timezone.utc
@@ -42,7 +43,7 @@ class SubmitBookingFlowTests(TestCase):
         end_at = start_at + timedelta(days=7, seconds=-1)
         return start_at, end_at
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_submit_serializer_stages_public_start_and_end_without_booking_slot(self, _mock_check_xdr):
         proposal = self._proposal()
         start_at, end_at = self._week_slot(weeks_ahead=1)
@@ -68,7 +69,7 @@ class SubmitBookingFlowTests(TestCase):
         self.assertIsNone(proposal.end_at)
         self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_submit_serializer_rejects_occupied_slot(self, _mock_check_xdr):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         ProposalQueueSlot.objects.create(
@@ -97,7 +98,7 @@ class SubmitBookingFlowTests(TestCase):
         self.assertIn('start_at', serializer.errors)
         self.assertIn('end_at', serializer.errors)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_submit_serializer_rejects_current_week(self, _mock_check_xdr):
         proposal = self._proposal()
         start_at, end_at = self._week_slot(weeks_ahead=0)
@@ -116,10 +117,10 @@ class SubmitBookingFlowTests(TestCase):
         self.assertIn('end_at', serializer.errors)
 
     @patch('aqua_governance.governance.proposal_transactions.timezone.now')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
     def test_confirmed_submit_accepts_slot_that_became_current_on_monday(
         self,
-        _mock_check_status,
+        _mock_verify_payment,
         mock_now,
     ):
         start_at = datetime(2026, 7, 13, 0, 0, 0, tzinfo=UTC)
@@ -151,8 +152,8 @@ class SubmitBookingFlowTests(TestCase):
             end_at=end_at,
         ).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_confirmed_submit_books_future_slot_and_sets_queued(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_confirmed_submit_books_future_slot_and_sets_queued(self, _mock_verify_payment):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         proposal = self._proposal(
             action=Proposal.TO_SUBMIT,
@@ -176,8 +177,8 @@ class SubmitBookingFlowTests(TestCase):
         self.assertIsNone(proposal.new_end_at)
         self.assertTrue(ProposalQueueSlot.objects.filter(proposal=proposal, start_at=start_at, end_at=end_at).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_check_payment_reclaims_stale_non_occupying_slot_and_books(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_check_payment_reclaims_stale_non_occupying_slot_and_books(self, _mock_verify_payment):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         scenarios = [
             ('hidden', {'hide': True, 'proposal_status': Proposal.QUEUED}),
@@ -228,8 +229,8 @@ class SubmitBookingFlowTests(TestCase):
                 )
                 self.assertFalse(ProposalQueueSlot.objects.filter(proposal=stale).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_check_payment_reclaims_mismatched_queued_or_voting_ghost_slot_and_books(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_check_payment_reclaims_mismatched_queued_or_voting_ghost_slot_and_books(self, _mock_verify_payment):
         booked_start, booked_end = self._week_slot(weeks_ahead=1)
         ghost_start, ghost_end = self._week_slot(weeks_ahead=2)
 
@@ -276,8 +277,8 @@ class SubmitBookingFlowTests(TestCase):
                 )
                 self.assertFalse(ProposalQueueSlot.objects.filter(proposal=ghost).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_confirmed_submit_starts_voting_when_slot_is_already_active(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_confirmed_submit_starts_voting_when_slot_is_already_active(self, _mock_verify_payment):
         start_at, end_at = self._week_slot(weeks_ahead=0)
         proposal = self._proposal(
             action=Proposal.TO_SUBMIT,
@@ -296,11 +297,8 @@ class SubmitBookingFlowTests(TestCase):
         self.assertTrue(ProposalQueueSlot.objects.filter(proposal=proposal, start_at=start_at, end_at=end_at).exists())
 
     @patch('aqua_governance.governance.proposal_transactions.logger')
-    @patch(
-        'aqua_governance.governance.proposal_transactions.check_proposal_status',
-        return_value=Proposal.HORIZON_ERROR,
-    )
-    def test_horizon_error_keeps_to_submit_without_booking_slot(self, _mock_check_status, mock_logger):
+    @patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.HORIZON_ERROR))
+    def test_horizon_error_keeps_to_submit_without_booking_slot(self, _mock_verify_payment, mock_logger):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         proposal = self._proposal(
             action=Proposal.TO_SUBMIT,
@@ -323,8 +321,8 @@ class SubmitBookingFlowTests(TestCase):
         self.assertIn('transaction_hash', _call_args[1]['extra'])
 
     @patch('aqua_governance.governance.proposal_transactions._alert_operator')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_paid_slot_conflict_keeps_submit_state_and_does_not_book_slot(self, _mock_check_status, mock_alert):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_paid_slot_conflict_keeps_submit_state_and_does_not_book_slot(self, _mock_verify_payment, mock_alert):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         stale_time = timezone.now() - timedelta(days=8)
         blocking_proposal = self._proposal(
@@ -372,10 +370,10 @@ class SubmitBookingFlowTests(TestCase):
     @patch('aqua_governance.governance.proposal_transactions.sync_proposal_queue_slot', side_effect=IntegrityError)
     @patch('aqua_governance.governance.proposal_transactions.find_queue_slot_conflict')
     @patch('aqua_governance.governance.proposal_transactions._alert_operator')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
     def test_submit_booking_integrity_error_rolls_back_confirmed_state_before_conflict_response(
         self,
-        _mock_check_status,
+        _mock_verify_payment,
         mock_alert,
         mock_find_conflict,
         _mock_sync_slot,
@@ -431,10 +429,15 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(proposal.history_proposal.count(), 0)
         mock_alert.assert_called_once()
 
-    @patch('aqua_governance.governance.views.ProposalViewSet._check_owner_permissions')
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_submit_endpoint_allows_immediate_retry_for_to_submit_conflict(self, _mock_check_status, _mock_check_xdr, _mock_owner):
+    @patch('aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch')
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_submit_endpoint_allows_immediate_retry_for_to_submit_conflict(
+        self,
+        _mock_verify_payment,
+        _mock_check_xdr,
+        _mock_owner,
+    ):
         first_start_at, first_end_at = self._week_slot(weeks_ahead=1)
         second_start_at, second_end_at = self._week_slot(weeks_ahead=2)
         stale_time = timezone.now() - timedelta(days=8)
@@ -493,8 +496,7 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(proposal.new_end_at, second_end_at)
         self.assertEqual(proposal.new_transaction_hash, 'c' * 64)
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', side_effect=[Proposal.HORIZON_ERROR, Proposal.FINE])
-    def test_retry_later_books_slot_when_confirmation_eventually_succeeds(self, _mock_check_status):
+    def test_retry_later_books_slot_when_confirmation_eventually_succeeds(self):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         proposal = self._proposal(
             action=Proposal.TO_SUBMIT,
@@ -503,9 +505,16 @@ class SubmitBookingFlowTests(TestCase):
             new_envelope_xdr='submit-xdr',
             new_transaction_hash='3' * 64,
         )
+        # Two statuses in sequence, so the verdicts are staged rather than answered per
+        # call; both are built over the hash the proposal actually presents.
+        staged_verdicts = [
+            verdict(Proposal.HORIZON_ERROR, proposal.new_transaction_hash),
+            verdict(Proposal.FINE, proposal.new_transaction_hash),
+        ]
 
-        first_result = proposal_transactions.check_transaction(proposal)
-        second_result = proposal_transactions.check_transaction(proposal)
+        with patch(VERIFY_PAYMENT, side_effect=staged_verdicts):
+            first_result = proposal_transactions.check_transaction(proposal)
+            second_result = proposal_transactions.check_transaction(proposal)
 
         proposal.refresh_from_db()
         self.assertEqual(first_result['outcome'], 'payment_not_confirmed')
@@ -513,8 +522,8 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(proposal.proposal_status, Proposal.QUEUED)
         self.assertTrue(ProposalQueueSlot.objects.filter(proposal=proposal, start_at=start_at, end_at=end_at).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_check_payment_endpoint_returns_conflict_response(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_check_payment_endpoint_returns_conflict_response(self, _mock_verify_payment):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         blocking_proposal = self._proposal(
             title='Blocking proposal',
@@ -571,11 +580,8 @@ class SubmitBookingFlowTests(TestCase):
         self.assertEqual(response.status_code, 404)
 
     @patch('aqua_governance.governance.proposal_transactions.sentry_sdk')
-    @patch(
-        'aqua_governance.governance.proposal_transactions.check_proposal_status',
-        return_value=Proposal.HORIZON_ERROR,
-    )
-    def test_horizon_error_does_not_capture_sentry_event(self, _mock_check_status, mock_sentry):
+    @patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.HORIZON_ERROR))
+    def test_horizon_error_does_not_capture_sentry_event(self, _mock_verify_payment, mock_sentry):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         proposal = self._proposal(
             action=Proposal.TO_SUBMIT,
@@ -591,8 +597,8 @@ class SubmitBookingFlowTests(TestCase):
         mock_sentry.capture_message.assert_not_called()
 
     @patch('aqua_governance.governance.proposal_transactions.sentry_sdk')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_slot_conflict_alerts_via_sentry(self, _mock_check_status, mock_sentry):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_slot_conflict_alerts_via_sentry(self, _mock_verify_payment, mock_sentry):
         start_at, end_at = self._week_slot(weeks_ahead=1)
         blocking_proposal = self._proposal(
             title='Blocking',
