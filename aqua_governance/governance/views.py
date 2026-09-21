@@ -25,6 +25,7 @@ from aqua_governance.governance.filters import (
     LogVoteOwnerFilterBackend,
     LogVoteProposalIdFilterBackend,
     ProposalVoteOwnerFilterBackend,
+    apply_vote_owner_queryset_filters,
     build_logvote_prefetch,
     is_active_vote_query,
 )
@@ -40,6 +41,7 @@ from aqua_governance.governance.serializers import (
 )
 from aqua_governance.governance import serializers_v2
 from aqua_governance.governance.serializers_v2 import AssetTokenSerializer
+from aqua_governance.governance.vote_eligibility import eligible_votes
 
 
 class AssetTokenView(ListModelMixin, GenericViewSet):
@@ -92,12 +94,12 @@ class ProposalsView(ListModelMixin, RetrieveModelMixin, CreateModelMixin, Generi
         queryset = super().get_queryset()
         active_only = is_active_vote_query(self.request)
         if self.action == "list" and active_only:
-            queryset = queryset.filter(logvote__hide=False, logvote__claimed=False).distinct()
+            queryset = apply_vote_owner_queryset_filters(queryset, self.request)
         return queryset.prefetch_related(build_logvote_prefetch(self.request))
 
 
 class LogVoteView(ListModelMixin, GenericViewSet):
-    queryset = LogVote.objects.filter(hide=False)
+    queryset = eligible_votes(LogVote.objects.all())
     permission_classes = (AllowAny,)
     serializer_class = LogVoteSerializer
     pagination_class = CustomPageNumberPagination
@@ -150,7 +152,7 @@ class ProposalViewSet(
         queryset = queryset.filter(draft=False)
         has_vote_owner_filter = bool(self.request.query_params.get('vote_owner_public_key'))
         if self.action == "list" and is_active_vote_query(self.request) and not has_vote_owner_filter:
-            queryset = queryset.filter(logvote__hide=False, logvote__claimed=False).distinct()
+            queryset = apply_vote_owner_queryset_filters(queryset, self.request)
 
         if has_vote_owner_filter:
             return queryset

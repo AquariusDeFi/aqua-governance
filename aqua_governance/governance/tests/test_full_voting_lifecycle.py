@@ -44,6 +44,10 @@ class FakeHorizonRequestBuilder:
         self._key = balance_id
         return self
 
+    def for_transaction(self, transaction_hash):
+        self._key = transaction_hash
+        return self
+
     def order(self, desc=False):
         return self
 
@@ -323,6 +327,28 @@ class FullVotingLifecycleTests(TestCase):
                 ],
             },
         )
+
+        # Service-sponsored balances need a provable original self-sponsored
+        # create operation. Supply the replacement transaction and its origin.
+        for balance_id, voter in (
+            (for_balance_id, SECONDARY_ACCOUNT),
+            (for_balance_id_secondary, SECONDARY_ACCOUNT),
+            (against_balance_id, TERTIARY_ACCOUNT),
+        ):
+            operations = fake_server._operations_by_balance_id
+            origin_id = f'origin-{balance_id}'
+            original = operations[balance_id][0]
+            operations[origin_id] = [{
+                **original, 'sponsor': voter, 'claimants': [{'destination': voter}],
+            }]
+            replacement = {
+                **original, 'id': f'create-{balance_id}', 'transaction_hash': f'tx-{balance_id}',
+                'sponsor': service_sponsor, 'claimants': [{'destination': voter}],
+            }
+            operations[balance_id] = [replacement]
+            operations[replacement['transaction_hash']] = [
+                {'type': 'clawback_claimable_balance', 'balance_id': origin_id}, replacement,
+            ]
 
         with patch('aqua_governance.governance.tasks.Server', return_value=fake_server):
             task_update_proposal_results(proposal.id, freezing_amount=False)

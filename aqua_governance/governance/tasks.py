@@ -6,6 +6,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
+
 from stellar_sdk import Server
 from stellar_sdk.soroban_rpc import GetTransactionStatus
 
@@ -15,13 +16,10 @@ from aqua_governance.governance.models import AssetToken, Proposal, ProposalQueu
 from aqua_governance.governance.onchain_hooks import execute_onchain_action
 from aqua_governance.governance.onchain_hooks.soroban import get_soroban_transaction
 from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
-from aqua_governance.governance.task_logic.proposal_finalization import (
-    update_proposal_final_results,
-)
-from aqua_governance.governance.task_logic.vote_indexing import (
-    update_proposal_votes_snapshot,
-)
+from aqua_governance.governance.task_logic.proposal_finalization import update_proposal_final_results
+from aqua_governance.governance.task_logic.vote_indexing import IncompleteVoteSnapshot, update_proposal_votes_snapshot
 from aqua_governance.taskapp import app as celery_app
+
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +156,36 @@ def task_check_pending_proposal_payments():
 
 @celery_app.task(ignore_result=True)
 def task_update_proposal_results(proposal_id: int, freezing_amount: bool = False):
-    task_update_votes(proposal_id, freezing_amount)
+    if task_update_votes(proposal_id, freezing_amount) is False:
+        return
     update_proposal_final_results(proposal_id)
+
+
+def _hold_incomplete_vote_snapshot(proposal_id: int) -> None:
+    with transaction.atomic():
+        proposal = Proposal.objects.select_for_update().filter(
+            pk=proposal_id, proposal_status=Proposal.VOTED,
+            proposal_type__in=Proposal.ASSET_PROPOSAL_TYPES,
+            onchain_execution_status__in=[
+                Proposal.ONCHAIN_EXECUTION_PENDING, Proposal.ONCHAIN_EXECUTION_FAILED,
+                Proposal.ONCHAIN_EXECUTION_SKIPPED,
+            ],
+            onchain_execution_tx_hash__isnull=True,
+            onchain_execution_started_at__isnull=True,
+            onchain_execution_submitted_at__isnull=True,
+            onchain_execution_poll_count=0,
+        ).first()
+        if proposal is None:
+            return
+        Proposal.objects.filter(pk=proposal.pk).update(
+            onchain_execution_status=Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW,
+        )
+        if proposal.asset_token_id:
+            AssetToken.objects.filter(pk=proposal.asset_token_id, contract_sync_tx_hash__isnull=True).update(
+                contract_sync_status=AssetToken.CONTRACT_SYNC_REQUIRES_REVIEW,
+                contract_sync_error=f'Proposal {proposal.pk} has incomplete original vote metadata; review required.',
+                contract_sync_updated_at=timezone.now(),
+            )
 
 
 @celery_app.task(ignore_result=True)
@@ -173,13 +199,20 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
         proposals = Proposal.objects.filter(id=proposal_id)
 
     horizon_server = Server(settings.HORIZON_URL)
+    complete = True
 
     for proposal in proposals:
-        update_proposal_votes_snapshot(
-            proposal=proposal,
-            horizon_server=horizon_server,
-            freezing_amount=freezing_amount,
-        )
+        try:
+            update_proposal_votes_snapshot(
+                proposal=proposal,
+                horizon_server=horizon_server,
+                freezing_amount=freezing_amount,
+            )
+        except IncompleteVoteSnapshot:
+            complete = False
+            logger.exception('Skip finalization of proposal %s: incomplete original vote metadata.', proposal.pk)
+            _hold_incomplete_vote_snapshot(proposal.pk)
+    return complete
 
 
 @celery_app.task(ignore_result=True)

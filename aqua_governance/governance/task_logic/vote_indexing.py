@@ -3,16 +3,19 @@ import sys
 from decimal import Decimal
 from typing import Any, Optional
 
-from dateutil.parser import parse as date_parse
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
+
+from dateutil.parser import parse as date_parse
+from requests.exceptions import RequestException
 from stellar_sdk import Server
-from stellar_sdk.exceptions import NotFoundError
+from stellar_sdk.exceptions import BaseRequestError, NotFoundError
 
 from aqua_governance.governance.claimable_trace import find_origin_claimable_balance_id
 from aqua_governance.governance.exceptions import ClaimableBalanceParsingError, GenerateGrouKeyException
 from aqua_governance.governance.models import LogVote, Proposal
-from aqua_governance.governance.parser import generate_vote_key, parse_vote
+from aqua_governance.governance.parser import generate_vote_key, is_supported_vote_asset, parse_vote
 from aqua_governance.governance.task_logic.unlock_rules import (
     extract_abs_before_values,
     get_expected_unlock_timestamp,
@@ -27,6 +30,10 @@ GROUP_UPDATE_NEW_VOTE = "new_vote"
 GROUP_UPDATE_MELTING = "melting"
 GROUP_UPDATE_UNCHANGED = "unchanged"
 GROUP_UPDATE_AMBIGUOUS = "ambiguous"
+
+
+class IncompleteVoteSnapshot(RuntimeError):
+    pass
 
 
 def update_proposal_votes_snapshot(
@@ -47,6 +54,7 @@ def update_proposal_votes_snapshot(
         new_log_vote: list[LogVote] = []
         update_log_vote: list[LogVote] = []
         processed_vote_ids: set[int] = set()
+        incomplete_balance_ids: set[str] = set()
         origin_cache: dict[str, Optional[str]] = {}
 
         logger.info("Proposal %s has %s vote groups", proposal.id, len(raw_vote_groups))
@@ -71,10 +79,16 @@ def update_proposal_votes_snapshot(
                 freezing_amount=freezing_amount,
                 horizon_server=horizon_server,
                 origin_cache=origin_cache,
+                incomplete_balance_ids=incomplete_balance_ids,
             )
             new_log_vote.extend(group_new_votes)
             update_log_vote.extend(group_updated_votes)
             processed_vote_ids.update(group_processed_vote_ids)
+
+        if incomplete_balance_ids:
+            raise IncompleteVoteSnapshot(
+                f'Proposal {proposal.pk} has unresolved original vote metadata: {sorted(incomplete_balance_ids)}',
+            )
 
         stale_vote_ids = [
             vote.id for vote in all_votes
@@ -120,6 +134,8 @@ def _build_raw_vote_groups(
 
     for request_builder, vote_choice in request_builders:
         for claimable_balance in load_all_records(request_builder):
+            if not is_supported_vote_asset(claimable_balance['asset']):
+                continue
             if not has_valid_unlock_date(claimable_balance, expected_unlock_timestamp):
                 logger.info(
                     "Skip claimable claimable_balance %s for proposal %s due to invalid abs_before values: %s",
@@ -195,6 +211,7 @@ def reconcile_vote_group(
     freezing_amount: bool,
     horizon_server: Optional[Server] = None,
     origin_cache: Optional[dict[str, Optional[str]]] = None,
+    incomplete_balance_ids: Optional[set[str]] = None,
 ) -> tuple[list[LogVote], list[LogVote], set[int]]:
     new_log_vote: list[LogVote] = []
     update_log_vote: list[LogVote] = []
@@ -220,6 +237,39 @@ def reconcile_vote_group(
         for vote in existing_votes
         if vote.claimable_balance_id is not None
     }
+    if proposal.end_at is not None:
+        eligible_raw_items = []
+        for raw_item in raw_items:
+            existing_vote = existing_by_balance_id.get(raw_item['balance_id'])
+            if existing_vote is not None:
+                if existing_vote.created_at is None or existing_vote.created_at > proposal.end_at:
+                    if existing_vote.created_at is None and incomplete_balance_ids is not None:
+                        incomplete_balance_ids.add(raw_item['balance_id'])
+                    _mark_votes_as_processed([existing_vote], processed_vote_ids)
+                    continue
+            else:
+                metadata = _load_original_metadata(
+                    horizon_server, raw_item['balance_id'], not raw_item['self_sponsored'], origin_cache,
+                )
+                if metadata is None:
+                    if incomplete_balance_ids is not None:
+                        incomplete_balance_ids.add(raw_item['balance_id'])
+                    if not raw_item['self_sponsored']:
+                        # An unresolved replacement may belong to any old row in
+                        # this group. Retry without claiming or changing them.
+                        _mark_votes_as_processed(existing_votes, processed_vote_ids)
+                        return [], [], processed_vote_ids
+                    continue
+                if metadata[0] > proposal.end_at:
+                    continue
+                raw_item['original_metadata'] = metadata
+            eligible_raw_items.append(raw_item)
+        raw_items = eligible_raw_items
+        existing_votes = [
+            vote for vote in existing_votes
+            if vote.created_at is not None and vote.created_at <= proposal.end_at
+        ]
+        existing_by_balance_id = {vote.claimable_balance_id: vote for vote in existing_votes}
     matched_existing_ids: set[int] = set()
     matched_raw_indexes: set[int] = set()
 
@@ -320,6 +370,7 @@ def reconcile_vote_group(
                 horizon_server=horizon_server,
                 origin_cache=origin_cache,
                 restore_from_origin=not raw_item["self_sponsored"],
+                original_metadata=raw_item.get('original_metadata'),
             )
             if new_vote is None:
                 logger.warning("Error create vote for %s, %s", vote_key, raw_item["index"])
@@ -423,6 +474,35 @@ def _mark_votes_as_processed(votes: list[LogVote], processed_vote_ids: set[int])
             processed_vote_ids.add(vote.id)
 
 
+def _load_original_metadata(horizon_server, balance_id, restore_from_origin, origin_cache):
+    """Require one dated create operation on the original balance, never a fallback."""
+    if horizon_server is None or not balance_id:
+        return None
+    metadata_balance_id = balance_id
+    if restore_from_origin:
+        metadata_balance_id = _resolve_origin_balance_id(horizon_server, balance_id, origin_cache)
+        if metadata_balance_id is None:
+            return None
+    try:
+        response = (
+            horizon_server.operations().for_claimable_balance(metadata_balance_id).order(desc=False).limit(200).call()
+        )
+        create_ops = [
+            record for record in response['_embedded']['records']
+            if record.get('type') == 'create_claimable_balance'
+        ]
+        if len(create_ops) != 1:
+            return None
+        created_at = date_parse(create_ops[0]['created_at'])
+        original_amount = Decimal(create_ops[0]['amount'])
+        if timezone.is_naive(created_at) or not original_amount.is_finite() or original_amount < 0:
+            return None
+        return created_at, str(original_amount)
+    except (BaseRequestError, RequestException, KeyError, TypeError, ValueError, ArithmeticError):
+        logger.warning('Unresolved original vote metadata for balance %s; retry later.', balance_id, exc_info=True)
+        return None
+
+
 def _make_new_vote(
     vote_key: str,
     vote_group_index: int,
@@ -433,12 +513,31 @@ def _make_new_vote(
     horizon_server: Optional[Server] = None,
     origin_cache: Optional[dict[str, Optional[str]]] = None,
     restore_from_origin: bool = False,
+    original_metadata=None,
 ):
     balance_id = claimable_balance['id']
     original_amount = None
     created_at = None
     metadata_balance_id = balance_id
     server = horizon_server if horizon_server is not None else Server(settings.HORIZON_URL)
+
+    if proposal.end_at is not None:
+        metadata = original_metadata or _load_original_metadata(
+            server, balance_id, restore_from_origin, origin_cache if origin_cache is not None else {},
+        )
+        if metadata is None or metadata[0] > proposal.end_at:
+            return None
+        return parse_vote(
+            vote_key=vote_key,
+            vote_group_index=vote_group_index,
+            claimable_balance=claimable_balance,
+            proposal=proposal,
+            vote_choice=vote_choice,
+            created_at=metadata[0],
+            original_amount=metadata[1],
+            vote_id=None,
+            freezing_amount=freezing_amount,
+        )
 
     if restore_from_origin and horizon_server is not None:
         if origin_cache is None:
