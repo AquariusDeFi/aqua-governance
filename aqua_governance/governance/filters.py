@@ -1,9 +1,10 @@
 from typing import Optional
 
-from django.db.models import Prefetch
+from django.db.models import Exists, OuterRef, Prefetch
 from rest_framework.filters import BaseFilterBackend
 
 from aqua_governance.governance.models import Proposal, LogVote
+from aqua_governance.governance.vote_eligibility import eligible_votes
 
 ACTIVE_QUERY_VALUES = {'1', 'true', 'yes', 'on'}
 
@@ -16,7 +17,7 @@ def is_active_vote_query(request) -> bool:
 
 
 def build_logvote_prefetch(request, public_key: Optional[str] = None) -> Prefetch:
-    queryset = LogVote.objects.filter(hide=False)
+    queryset = eligible_votes(LogVote.objects.all())
     if public_key:
         queryset = queryset.filter(account_issuer=public_key)
     if is_active_vote_query(request):
@@ -24,14 +25,13 @@ def build_logvote_prefetch(request, public_key: Optional[str] = None) -> Prefetc
     return Prefetch('logvote_set', queryset.order_by('-created_at'))
 
 
-def apply_vote_owner_queryset_filters(queryset, request, public_key: str):
-    filter_kwargs = {
-        'logvote__account_issuer': public_key,
-        'logvote__hide': False,
-    }
+def apply_vote_owner_queryset_filters(queryset, request, public_key: Optional[str] = None):
+    votes = eligible_votes(LogVote.objects.filter(proposal_id=OuterRef('pk')))
+    if public_key:
+        votes = votes.filter(account_issuer=public_key)
     if is_active_vote_query(request):
-        filter_kwargs['logvote__claimed'] = False
-    return queryset.filter(**filter_kwargs).distinct()
+        votes = votes.filter(claimed=False)
+    return queryset.filter(Exists(votes))
 
 
 class HideFilterBackend(BaseFilterBackend):  # TODO: remove it
