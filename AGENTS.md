@@ -96,7 +96,6 @@ Settings default to `config.settings.dev`; the suite runs against it.
 │                                                              │
 │  task_check_expired_proposals (every 24h)                    │
 │  check_proposals_with_bad_horizon_error (every 10 min)       │
-│  task_update_votes (every 10 min, for VOTED proposals)       │
 └───────────────────────┬────────────────────────────────────┘
                         │
                         ▼
@@ -314,7 +313,11 @@ Phase 4 — Bulk DB operations:
 | `task_update_active_proposals` | Every 5 min | Re-indexes votes for all VOTING proposals |
 | `task_check_expired_proposals` | Every 24h | Marks DISCUSSION → EXPIRED after 30 days inactive |
 | `check_proposals_with_bad_horizon_error` | Every 10 min | Retries Horizon payment check for `HORIZON_ERROR` proposals |
-| `task_update_votes` | Every 10 min | Re-indexes votes for all VOTED proposals |
+
+`task_update_votes` requires an explicit proposal ID for indexing. Completed
+proposals are not periodically re-indexed; legacy queued calls without an ID
+return without reading or changing data. Active voting updates and the final
+freeze at closing still call the task with the proposal ID.
 
 ### Signal-Triggered
 
