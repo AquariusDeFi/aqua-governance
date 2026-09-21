@@ -202,10 +202,10 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
     Update votes for proposal.
     """
     if proposal_id is None:
-        proposals = Proposal.objects.filter(proposal_status__in=[Proposal.VOTED]).order_by('-id')
-    else:
-        proposals = Proposal.objects.filter(id=proposal_id)
+        # Accept historical bulk-update tasks already queued before their schedule was removed.
+        return True
 
+    proposals = Proposal.objects.filter(id=proposal_id)
     horizon_server = Server(settings.HORIZON_URL)
     complete = True
 
