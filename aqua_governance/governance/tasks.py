@@ -154,9 +154,17 @@ def task_check_pending_proposal_payments():
         proposal_transactions.check_transaction(proposal)
 
 
-@celery_app.task(ignore_result=True)
-def task_update_proposal_results(proposal_id: int, freezing_amount: bool = False):
+@celery_app.task(bind=True, ignore_result=True)
+def task_update_proposal_results(self, proposal_id: int, freezing_amount: bool = False):
     if task_update_votes(proposal_id, freezing_amount) is False:
+        if freezing_amount and Proposal.objects.filter(
+            pk=proposal_id,
+            proposal_type=Proposal.PROPOSAL_TYPE_GENERAL,
+            proposal_status=Proposal.VOTED,
+        ).exists():
+            raise self.retry(exc=IncompleteVoteSnapshot(
+                f'Proposal {proposal_id} final vote snapshot has incomplete original metadata.',
+            ))
         return
     update_proposal_final_results(proposal_id)
 

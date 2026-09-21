@@ -11,9 +11,13 @@ from rest_framework.test import APIClient
 from requests.exceptions import ConnectionError
 
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
-from aqua_governance.governance.task_logic.proposal_finalization import _sum_votes_for_proposal
+from aqua_governance.governance.task_logic.proposal_finalization import (
+    _sum_votes_for_proposal,
+    update_proposal_final_results,
+)
 from aqua_governance.governance.task_logic.unlock_rules import get_expected_unlock_timestamp
 from aqua_governance.governance.task_logic.vote_indexing import (
+    IncompleteVoteSnapshot,
     _make_new_vote,
     reconcile_vote_group,
     update_proposal_votes_snapshot,
@@ -266,6 +270,81 @@ class LateVoteTests(TestCase):
         finalize.assert_not_called()
         proposal.refresh_from_db()
         self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW)
+
+    def test_general_final_snapshot_retries_and_freezes_complete_results(self):
+        old = self.stored_vote(key='old-key', voted_amount=None)
+        groups = {
+            'old-key': [(LogVote.VOTE_FOR, self.raw_vote('old'))],
+            'new-key': [(LogVote.VOTE_AGAINST, self.raw_vote('new'))],
+        }
+        with patch(f'{INDEXING}._build_raw_vote_groups', return_value=groups), patch(
+            f'{INDEXING}._load_original_metadata', side_effect=[None, (self.end, '120')],
+        ), patch('aqua_governance.governance.tasks.Server'), patch(
+            'aqua_governance.governance.tasks.update_proposal_votes_snapshot',
+            wraps=update_proposal_votes_snapshot,
+        ) as snapshot, patch(
+            'aqua_governance.governance.tasks.update_proposal_final_results',
+            wraps=update_proposal_final_results,
+        ) as finalize, patch(
+            'aqua_governance.governance.task_logic.proposal_finalization._update_ice_circulating_supply',
+            return_value=True,
+        ), patch('aqua_governance.governance.tasks.task_execute_onchain_action_send.delay') as enqueue:
+            result = task_update_proposal_results.apply(
+                kwargs={'proposal_id': self.proposal.pk, 'freezing_amount': True}, throw=False,
+            )
+        self.assertTrue(result.successful())
+        self.assertEqual(snapshot.call_count, 2)
+        self.assertEqual(
+            [(call.kwargs['proposal'].pk, call.kwargs['freezing_amount']) for call in snapshot.call_args_list],
+            [(self.proposal.pk, True), (self.proposal.pk, True)],
+        )
+        finalize.assert_called_once_with(self.proposal.pk)
+        enqueue.assert_not_called()
+        self.proposal.refresh_from_db()
+        old.refresh_from_db()
+        new = self.proposal.logvote_set.get(claimable_balance_id='new')
+        self.assertEqual(old.voted_amount, Decimal('90'))
+        self.assertEqual(new.voted_amount, Decimal('90'))
+        self.assertEqual(self.proposal.vote_for_result, Decimal('90'))
+        self.assertEqual(self.proposal.vote_against_result, Decimal('90'))
+
+    def test_general_final_snapshot_retry_exhaustion_fails_without_finalizing(self):
+        with patch('aqua_governance.governance.tasks.Server'), patch(
+            'aqua_governance.governance.tasks.update_proposal_votes_snapshot',
+            side_effect=IncompleteVoteSnapshot('metadata unavailable'),
+        ) as snapshot, patch('aqua_governance.governance.tasks.update_proposal_final_results') as finalize:
+            result = task_update_proposal_results.apply(args=(self.proposal.pk, True), throw=False)
+        self.assertTrue(result.failed())
+        self.assertIsInstance(result.result, IncompleteVoteSnapshot)
+        self.assertEqual(snapshot.call_count, task_update_proposal_results.max_retries + 1)
+        finalize.assert_not_called()
+
+    def test_incomplete_asset_final_snapshot_is_held_without_retry(self):
+        proposal = make_asset_proposal()
+        Proposal.objects.filter(pk=proposal.pk).update(end_at=self.end, proposal_status=Proposal.VOTED)
+        with patch('aqua_governance.governance.tasks.Server'), patch(
+            'aqua_governance.governance.tasks.update_proposal_votes_snapshot',
+            side_effect=IncompleteVoteSnapshot('metadata unavailable'),
+        ) as snapshot, patch('aqua_governance.governance.tasks.update_proposal_final_results') as finalize:
+            result = task_update_proposal_results.apply(args=(proposal.pk, True), throw=False)
+        self.assertTrue(result.successful())
+        snapshot.assert_called_once()
+        finalize.assert_not_called()
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW)
+
+    def test_general_incomplete_nonfinal_snapshot_does_not_retry(self):
+        for status, freezing in [(Proposal.VOTING, False), (Proposal.VOTED, False), (Proposal.VOTING, True)]:
+            with self.subTest(status=status, freezing=freezing):
+                Proposal.objects.filter(pk=self.proposal.pk).update(proposal_status=status)
+                with patch('aqua_governance.governance.tasks.Server'), patch(
+                    'aqua_governance.governance.tasks.update_proposal_votes_snapshot',
+                    side_effect=IncompleteVoteSnapshot('metadata unavailable'),
+                ) as snapshot, patch('aqua_governance.governance.tasks.update_proposal_final_results') as finalize:
+                    result = task_update_proposal_results.apply(args=(self.proposal.pk, freezing), throw=False)
+                self.assertTrue(result.successful())
+                snapshot.assert_called_once()
+                finalize.assert_not_called()
 
     def test_frozen_and_live_tallies_exclude_late_and_unknown_votes_for_all_choices(self):
         for index, choice in enumerate([LogVote.VOTE_FOR, LogVote.VOTE_AGAINST, LogVote.VOTE_ABSTAIN]):
