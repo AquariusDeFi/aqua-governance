@@ -18,7 +18,11 @@ from aqua_governance.governance.models import AssetToken, LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key
 from aqua_governance.governance.task_logic.proposal_finalization import _sum_votes_for_proposal
 from aqua_governance.governance.task_logic.unlock_rules import get_expected_unlock_timestamp
-from aqua_governance.governance.task_logic.vote_indexing import IncompleteVoteSnapshot, update_proposal_votes_snapshot
+from aqua_governance.governance.task_logic.vote_indexing import (
+    IncompleteVoteSnapshot,
+    reconcile_vote_group,
+    update_proposal_votes_snapshot,
+)
 from aqua_governance.governance.tasks import (
     CLOSED_PROPOSAL_CLAIM_SYNC_DELAY,
     task_retry_failed_onchain_executions,
@@ -755,6 +759,28 @@ class HorizonCallBudgetTests(TestCase):
         # b-3 metadata: 1 call for b-0's create operation, with the origin reused from the walk.
         self.assertEqual(horizon.operations_calls, 10)
 
+    def test_lineage_walk_records_the_origin_it_reaches(self):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
+        stored_replacement = _raw_vote(proposal, 'a-2', amount='900')
+        unstored_replacement = _raw_vote(proposal, 'b-3', amount='800')
+        key = generate_vote_key(stored_replacement, proposal, LogVote.VOTE_FOR)
+        stored = _vote(proposal, claimable_balance_id='a-1', key=key)
+        parents = {'a-1': None, 'a-2': 'a-1', 'b-0': None, 'b-1': 'b-0', 'b-2': 'b-1', 'b-3': 'b-2'}
+        origin_cache = {}
+
+        reconcile_vote_group(
+            vote_key=key,
+            raw_vote_group=[(LogVote.VOTE_FOR, stored_replacement), (LogVote.VOTE_FOR, unstored_replacement)],
+            existing_votes=[stored],
+            all_votes=proposal.logvote_set.filter(hide=False),
+            proposal=proposal,
+            freezing_amount=False,
+            horizon_server=_ChainHorizon(parents, proposal.end_at - timedelta(days=3)),
+            origin_cache=origin_cache,
+        )
+
+        self.assertEqual(origin_cache, {'b-3': 'b-0'})
+
     def test_batched_melt_transaction_is_loaded_once_per_snapshot(self):
         proposal = _closed_general(ended_ago=timedelta(days=2))
         ice_replacement = _raw_vote(proposal, 'ice-2', asset_code=settings.GOVERNANCE_ICE_ASSET_CODE)
@@ -977,6 +1003,38 @@ class ExcludedLineageAdvanceTests(TestCase):
         hidden.refresh_from_db()
         self.assertEqual(hidden.claimable_balance_id, 'h-4')
         self.assertFalse(proposal.logvote_set.filter(hide=False, claimable_balance_id__in=['h-5a', 'h-5b']).exists())
+
+    def test_visible_row_decides_when_a_balance_is_stored_visible_and_hidden(self):
+        for late in (False, True):
+            with self.subTest(late=late):
+                proposal, _, _, live_raw = _proposal_with_live_and_gone_votes()
+                replacement = _raw_vote(proposal, _chain_id(4), asset_code=settings.GOVERNANCE_ICE_ASSET_CODE)
+                key = generate_vote_key(replacement, proposal, LogVote.VOTE_FOR)
+                created_at = proposal.end_at + timedelta(hours=1) if late else proposal.end_at - timedelta(days=1)
+                visible = _vote(
+                    proposal, claimable_balance_id=_chain_id(3), asset_code=settings.GOVERNANCE_ICE_ASSET_CODE,
+                    created_at=created_at, key=key,
+                )
+                hidden = _vote(
+                    proposal, claimable_balance_id=_chain_id(3), hide=True,
+                    asset_code=settings.GOVERNANCE_ICE_ASSET_CODE, created_at=proposal.end_at + timedelta(hours=1),
+                    key=key,
+                )
+                horizon = _ChainHorizon.linear(4, proposal.end_at - timedelta(days=3))
+
+                self._sync(proposal, [live_raw, replacement], horizon)
+
+                visible.refresh_from_db()
+                hidden.refresh_from_db()
+                self.assertEqual(
+                    (visible.claimable_balance_id, visible.amount, visible.created_at, visible.claimed),
+                    (_chain_id(4), Decimal('900'), created_at, False),
+                )
+                self.assertEqual(hidden.claimable_balance_id, _chain_id(3))
+                self.assertEqual(
+                    _chain_id(4) in self._public_balance_ids(proposal), not late,
+                )
+                LogVote.objects.filter(proposal=proposal).delete()
 
     def test_excluded_row_is_not_moved_onto_an_id_another_row_already_has(self):
         proposal, live, _, live_raw = _proposal_with_live_and_gone_votes()
