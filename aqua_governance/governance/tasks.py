@@ -4,7 +4,7 @@ from typing import Optional
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F
+from django.db.models import Exists, F, OuterRef
 from django.utils import timezone
 
 from stellar_sdk import Server
@@ -12,7 +12,7 @@ from stellar_sdk.soroban_rpc import GetTransactionStatus
 
 from aqua_governance.governance import proposal_transactions
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
-from aqua_governance.governance.models import AssetToken, Proposal, ProposalQueueSlot
+from aqua_governance.governance.models import AssetToken, LogVote, Proposal, ProposalQueueSlot
 from aqua_governance.governance.onchain_hooks import execute_onchain_action
 from aqua_governance.governance.onchain_hooks.soroban import get_soroban_transaction
 from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
@@ -22,6 +22,17 @@ from aqua_governance.taskapp import app as celery_app
 
 
 logger = logging.getLogger(__name__)
+
+# Keeps the claim sync clear of the closing freeze and its retries.
+CLOSED_PROPOSAL_CLAIM_SYNC_DELAY = timedelta(hours=1)
+# Execution statuses whose stored results are never recomputed. PENDING/FAILED results are recomputed by
+# task_retry_failed_onchain_executions from `amount` when `voted_amount` is None, IN_PROGRESS/SUBMITTED can
+# still become FAILED, and REQUIRES_REVIEW is operator-owned.
+CLOSED_PROPOSAL_CLAIM_SYNC_EXECUTION_STATUSES = (
+    Proposal.ONCHAIN_EXECUTION_NOT_REQUIRED,
+    Proposal.ONCHAIN_EXECUTION_SKIPPED,
+    Proposal.ONCHAIN_EXECUTION_SUCCESS,
+)
 
 
 def _start_due_scheduled_proposals(now) -> int:
@@ -221,6 +232,36 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
             logger.exception('Skip finalization of proposal %s: incomplete original vote metadata.', proposal.pk)
             _hold_incomplete_vote_snapshot(proposal.pk)
     return complete
+
+
+def _closed_proposals_with_unclaimed_votes(now):
+    unclaimed_votes = LogVote.objects.filter(proposal=OuterRef('pk'), hide=False, claimed=False)
+    return Proposal.objects.filter(
+        Exists(unclaimed_votes),
+        proposal_status=Proposal.VOTED,
+        hide=False,
+        end_at__lte=now - CLOSED_PROPOSAL_CLAIM_SYNC_DELAY,
+        onchain_execution_status__in=CLOSED_PROPOSAL_CLAIM_SYNC_EXECUTION_STATUSES,
+    ).order_by('id')
+
+
+@celery_app.task(ignore_result=True)
+def task_sync_closed_proposal_claims():
+    """
+    Follow melting replacements and claims of closed proposals' votes without touching frozen results.
+    """
+    horizon_server = Server(settings.HORIZON_URL)
+    for proposal in _closed_proposals_with_unclaimed_votes(timezone.now()):
+        try:
+            update_proposal_votes_snapshot(
+                proposal=proposal,
+                horizon_server=horizon_server,
+                freezing_amount=False,
+            )
+        except IncompleteVoteSnapshot:
+            logger.warning('Skip claim sync of closed proposal %s: incomplete original vote metadata.', proposal.pk)
+        except Exception:  # noqa: B902
+            logger.exception('Claim sync of closed proposal %s failed.', proposal.pk)
 
 
 @celery_app.task(ignore_result=True)
