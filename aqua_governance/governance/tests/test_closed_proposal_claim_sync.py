@@ -96,6 +96,95 @@ def _horizon(created_at):
     return server
 
 
+class _ChainHorizon:
+    """
+    Horizon stand-in for melting chains: each balance in `parents` was created by a service-sponsored
+    clawback→create of its parent; a balance whose parent is None is the voter's own create.
+    """
+
+    def __init__(self, parents, created_at, on_operations_call=None):
+        self.parents = parents
+        self.created_at = created_at
+        self.on_operations_call = on_operations_call
+        self.operations_calls = 0
+
+    @classmethod
+    def linear(cls, length, created_at, **kwargs):
+        parents = {_chain_id(0): None}
+        parents.update({_chain_id(step): _chain_id(step - 1) for step in range(1, length + 1)})
+        return cls(parents, created_at, **kwargs)
+
+    def claimable_balances(self):
+        return _BalancesRequest()
+
+    def operations(self):
+        return _OperationsRequest(self)
+
+    def balance_records(self, balance_id):
+        parent = self.parents[balance_id]
+        return [{
+            'id': f'create-{balance_id}',
+            'type': 'create_claimable_balance',
+            'transaction_hash': f'tx-{balance_id}',
+            'created_at': self.created_at.isoformat(),
+            'amount': '1000',
+            'sponsor': DEFAULT_PROPOSED_BY if parent is None else SECONDARY_ACCOUNT,
+            'claimants': [{'destination': DEFAULT_PROPOSED_BY}],
+        }]
+
+    def transaction_records(self, transaction_hash):
+        balance_id = transaction_hash[len('tx-'):]
+        records = [{'id': f'create-{balance_id}', 'type': 'create_claimable_balance'}]
+        if self.parents[balance_id] is not None:
+            records.insert(0, {
+                'id': f'clawback-{balance_id}',
+                'type': 'clawback_claimable_balance',
+                'balance_id': self.parents[balance_id],
+            })
+        return records
+
+
+class _BalancesRequest:
+    claimant = None
+
+    def for_claimant(self, claimant):
+        self.claimant = claimant
+        return self
+
+    def order(self, *args, **kwargs):
+        return self
+
+
+class _OperationsRequest:
+    def __init__(self, horizon):
+        self.horizon = horizon
+        self.load = None
+
+    def for_claimable_balance(self, balance_id):
+        self.load = lambda: self.horizon.balance_records(balance_id)
+        return self
+
+    def for_transaction(self, transaction_hash):
+        self.load = lambda: self.horizon.transaction_records(transaction_hash)
+        return self
+
+    def order(self, *args, **kwargs):
+        return self
+
+    def limit(self, *args, **kwargs):
+        return self
+
+    def call(self):
+        self.horizon.operations_calls += 1
+        if self.horizon.on_operations_call is not None:
+            self.horizon.on_operations_call()
+        return {'_embedded': {'records': self.load()}}
+
+
+def _chain_id(step):
+    return f'chain-{step}'
+
+
 def _synced_proposal_ids():
     with patch(f'{TASKS}.Server'), patch(f'{TASKS}.update_proposal_votes_snapshot') as snapshot:
         task_sync_closed_proposal_claims()
@@ -273,3 +362,24 @@ class ClosedProposalClaimSyncIndexingTests(TestCase):
         self.assertEqual(unfrozen.claimable_balance_id, 'unfrozen')
         self.assertEqual(unfrozen.amount, Decimal('1000'))
         self.assertEqual(proposal.vote_for_result, Decimal('1000'))
+
+    def test_concurrent_freeze_is_not_overwritten_by_the_sync(self):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
+        replacement = _raw_vote(proposal, _chain_id(2))
+        vote = _vote(
+            proposal, claimable_balance_id=_chain_id(1), voted_amount=None,
+            key=generate_vote_key(replacement, proposal, LogVote.VOTE_FOR),
+        )
+
+        def freeze_concurrently():
+            LogVote.objects.filter(pk=vote.pk).update(voted_amount=Decimal('777'))
+
+        horizon = _ChainHorizon.linear(2, vote.created_at, on_operations_call=freeze_concurrently)
+        with patch(f'{TASKS}.Server', return_value=horizon), patch(
+            f'{INDEXING}.load_all_records', side_effect=[[replacement], [], []],
+        ):
+            task_sync_closed_proposal_claims()
+
+        vote.refresh_from_db()
+        self.assertEqual(vote.claimable_balance_id, _chain_id(2))
+        self.assertEqual(vote.voted_amount, Decimal('777'))
