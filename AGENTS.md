@@ -94,6 +94,9 @@ Settings default to `config.settings.dev`; the suite runs against it.
 │         ├→ task_update_votes       (index CBs from Horizon) │
 │         └→ _update_proposal_final_results (sum + supply)    │
 │                                                              │
+│  task_sync_closed_proposal_claims (every 10 min)             │
+│    └→ update_proposal_votes_snapshot (VOTED, no freeze)      │
+│                                                              │
 │  task_check_expired_proposals (every 24h)                    │
 │  check_proposals_with_bad_horizon_error (every 10 min)       │
 └───────────────────────┬────────────────────────────────────┘
@@ -311,13 +314,32 @@ Phase 4 — Bulk DB operations:
 | Task | Schedule | Purpose |
 |------|----------|---------|
 | `task_update_active_proposals` | Every 5 min | Re-indexes votes for all VOTING proposals |
+| `task_sync_closed_proposal_claims` | Every 10 min | Follows melting replacements and claims of closed proposals' votes |
 | `task_check_expired_proposals` | Every 24h | Marks DISCUSSION → EXPIRED after 30 days inactive |
 | `check_proposals_with_bad_horizon_error` | Every 10 min | Retries Horizon payment check for `HORIZON_ERROR` proposals |
 
-`task_update_votes` requires an explicit proposal ID for indexing. Completed
-proposals are not periodically re-indexed; legacy queued calls without an ID
-return without reading or changing data. Active voting updates and the final
-freeze at closing still call the task with the proposal ID.
+`task_update_votes` requires an explicit proposal ID for indexing; legacy queued
+calls without an ID return without reading or changing data. Active voting
+updates and the final freeze at closing call it with the proposal ID.
+
+`task_sync_closed_proposal_claims` keeps `claimable_balance_id`, `amount` and
+`claimed` of closed proposals in step with ICE melting (which replaces a vote's
+claimable balance with a new id) and with claims. It re-indexes proposals that
+are `VOTED`, not hidden, closed at least an hour ago (clear of the closing
+freeze and its retries), still have an unclaimed visible vote, and have
+`onchain_execution_status` `NOT_REQUIRED`, `SKIPPED` or `SUCCESS`. It calls
+`update_proposal_votes_snapshot` directly with `freezing_amount=False`, so
+frozen `voted_amount` values are kept and late votes stay excluded. It never
+recomputes results, finalizes, or puts a proposal into review: an incomplete
+snapshot or a Horizon error is logged and the proposal is retried on the next
+run. `PENDING`/`FAILED` asset proposals are excluded because
+`task_retry_failed_onchain_executions` recomputes their results from `amount`
+when `voted_amount` is `None`; `IN_PROGRESS`/`SUBMITTED` can still become
+`FAILED`, and `REQUIRES_REVIEW` is operator-owned.
+
+The `repair_late_vote` management command requires all writers to be paused and
+drained; `task_sync_closed_proposal_claims` writes votes, so pause its Beat entry
+and drain queued runs too before a preview or apply.
 
 ### Signal-Triggered
 
@@ -339,6 +361,9 @@ task_update_proposal_status  [signal-triggered at end_at]
   → task_update_proposal_results(proposal_id, freezing_amount=True)
       → task_update_votes(proposal_id, True)         # indexes CBs, sets voted_amount
       → _update_proposal_final_results(proposal_id)  # final tally
+
+task_sync_closed_proposal_claims  [VOTED, closed ≥ 1h, unclaimed votes]
+  → update_proposal_votes_snapshot(proposal, freezing_amount=False)  # no tally, no review
 ```
 
 ---
