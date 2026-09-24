@@ -14,7 +14,7 @@ from requests.exceptions import RequestException
 from stellar_sdk import Server
 from stellar_sdk.exceptions import BaseRequestError, NotFoundError
 
-from aqua_governance.governance.claimable_trace import find_origin_claimable_balance_id, find_stored_ancestor_balance_id
+from aqua_governance.governance.claimable_trace import find_origin_claimable_balance_id, trace_to_stored_ancestor
 from aqua_governance.governance.exceptions import ClaimableBalanceParsingError, GenerateGrouKeyException
 from aqua_governance.governance.models import LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key, is_supported_vote_asset, parse_vote
@@ -69,6 +69,7 @@ def update_proposal_votes_snapshot(
         processed_vote_ids: set[int] = set()
         incomplete_balance_ids: set[str] = set()
         origin_cache: dict[str, Optional[str]] = {}
+        transaction_cache: dict[str, list[dict[str, Any]]] = {}
         unresolved_groups = 0
 
         logger.info("Proposal %s has %s vote groups", proposal.id, len(raw_vote_groups))
@@ -96,6 +97,7 @@ def update_proposal_votes_snapshot(
                 origin_cache=origin_cache,
                 incomplete_balance_ids=group_incomplete_balance_ids,
                 hidden_balance_ids=hidden_balance_ids_by_key.get(vote_key, set()),
+                transaction_cache=transaction_cache,
             )
             if group_incomplete_balance_ids and not strict:
                 logger.warning(
@@ -243,6 +245,7 @@ def reconcile_vote_group(
     origin_cache: Optional[dict[str, Optional[str]]] = None,
     incomplete_balance_ids: Optional[set[str]] = None,
     hidden_balance_ids: Optional[set[str]] = None,
+    transaction_cache: Optional[dict[str, list[dict[str, Any]]]] = None,
 ) -> tuple[list[LogVote], list[LogVote], set[int]]:
     new_log_vote: list[LogVote] = []
     update_log_vote: list[LogVote] = []
@@ -273,6 +276,8 @@ def reconcile_vote_group(
         raw_items=raw_items,
         existing_by_balance_id=existing_by_balance_id,
         hidden_balance_ids=hidden_balance_ids or set(),
+        origin_cache=origin_cache,
+        transaction_cache=transaction_cache,
     )
     if hidden_lineage_indexes:
         # Replacements of hidden votes stay excluded, like the hidden votes themselves.
@@ -450,12 +455,14 @@ def _match_service_replacements_by_lineage(
     raw_items: list[dict[str, Any]],
     existing_by_balance_id: dict[str, LogVote],
     hidden_balance_ids: set[str],
+    origin_cache: dict[str, Optional[str]],
+    transaction_cache: Optional[dict[str, list[dict[str, Any]]]] = None,
 ) -> tuple[dict[int, LogVote], set[int]]:
     """
     Map service-sponsored replacements to the stored vote whose balance their replacement chain
     passes through, one to one. Replacements that share a stored vote, or whose chain does not reach
     one, are left to origin matching. Replacements whose chain reaches a hidden vote are returned
-    separately so they can be excluded.
+    separately so they can be excluded. An origin reached by the walk is recorded in origin_cache.
     """
     hidden_balance_ids = hidden_balance_ids - set(existing_by_balance_id)
     if horizon_server is None or not (existing_by_balance_id or hidden_balance_ids):
@@ -470,13 +477,18 @@ def _match_service_replacements_by_lineage(
         if raw_item['self_sponsored'] or not balance_id or balance_id in existing_by_balance_id:
             continue
         try:
-            ancestor_balance_id = find_stored_ancestor_balance_id(horizon_server, balance_id, stored_balance_ids)
+            trace = trace_to_stored_ancestor(
+                horizon_server, balance_id, stored_balance_ids, transaction_cache=transaction_cache,
+            )
         except SoftTimeLimitExceeded:
             raise
         except Exception:  # noqa: B902
             logger.warning('Lineage trace failed for balance %s; fall back to origin matching.', balance_id,
                            exc_info=True)
             continue
+        if trace.origin_balance_id is not None:
+            origin_cache[balance_id] = trace.origin_balance_id
+        ancestor_balance_id = trace.stored_balance_id
         if ancestor_balance_id in hidden_balance_ids:
             hidden_indexes.add(raw_item['index'])
         elif ancestor_balance_id is not None and ancestor_balance_id not in current_balance_ids:

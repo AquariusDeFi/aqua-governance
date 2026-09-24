@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from stellar_sdk import Server
 
@@ -155,57 +155,81 @@ def find_origin_claimable_balance_id(
     return None
 
 
-def find_stored_ancestor_balance_id(
+class StoredAncestorTrace(NamedTuple):
+    stored_balance_id: Optional[str] = None
+    origin_balance_id: Optional[str] = None
+
+
+def trace_to_stored_ancestor(
     horizon_server: Server,
     start_balance_id: str,
     stored_balance_ids: set[str],
     *,
+    transaction_cache: Optional[dict[str, list[dict[str, Any]]]] = None,
     max_depth: int = 120,
     per_call_limit: int = 200,
-) -> Optional[str]:
+) -> StoredAncestorTrace:
     """
     Trace claimable-balance replacement chain backwards from start_balance_id until the first
-    previous balance id that is in stored_balance_ids.
+    previous balance id that is in stored_balance_ids, and return it as stored_balance_id.
 
-    Returns that balance id, or None when the chain reaches the voter's own create operation,
-    cannot be followed, or exceeds max_depth first.
+    If the chain reaches the voter's own create operation first, that balance is returned as
+    origin_balance_id, as find_origin_claimable_balance_id would find it. Neither is returned when the
+    chain cannot be followed or exceeds max_depth. transaction_cache maps transaction hashes to their
+    operation records; it is read and filled so batched melt transactions are loaded once.
     """
     current_balance_id = start_balance_id
     for _ in range(max_depth):
-        previous_balance_id = _load_previous_balance_id(horizon_server, current_balance_id, per_call_limit)
+        balance_ops = (
+            horizon_server.operations()
+            .for_claimable_balance(current_balance_id)
+            .limit(per_call_limit)
+            .order(False)
+            .call()
+        )
+        create_op = _extract_single_create_op(_extract_records(balance_ops))
+        if create_op is None:
+            return StoredAncestorTrace()
+        if _sponsor_in_claimant_destinations(create_op):
+            return StoredAncestorTrace(origin_balance_id=current_balance_id)
+
+        previous_balance_id = _load_clawed_back_balance_id(
+            horizon_server, create_op, per_call_limit, transaction_cache,
+        )
         if previous_balance_id is None:
-            return None
+            return StoredAncestorTrace()
         if previous_balance_id in stored_balance_ids:
-            return previous_balance_id
+            return StoredAncestorTrace(stored_balance_id=previous_balance_id)
         current_balance_id = previous_balance_id
-    return None
+    return StoredAncestorTrace()
 
 
-def _load_previous_balance_id(horizon_server: Server, balance_id: str, per_call_limit: int) -> Optional[str]:
-    balance_ops = (
-        horizon_server.operations()
-        .for_claimable_balance(balance_id)
-        .limit(per_call_limit)
-        .order(False)
-        .call()
-    )
-    create_op = _extract_single_create_op(_extract_records(balance_ops))
-    if create_op is None or _sponsor_in_claimant_destinations(create_op):
-        return None
-
+def _load_clawed_back_balance_id(
+    horizon_server: Server,
+    create_op: dict[str, Any],
+    per_call_limit: int,
+    transaction_cache: Optional[dict[str, list[dict[str, Any]]]],
+) -> Optional[str]:
     transaction_hash = create_op.get("transaction_hash")
     create_operation_id = create_op.get("id")
     if transaction_hash is None or create_operation_id is None:
         return None
 
-    tx_ops = (
-        horizon_server.operations()
-        .for_transaction(str(transaction_hash))
-        .limit(per_call_limit)
-        .order(False)
-        .call()
-    )
-    return _extract_previous_balance_id(_extract_records(tx_ops), str(create_operation_id))
+    transaction_hash = str(transaction_hash)
+    if transaction_cache is not None and transaction_hash in transaction_cache:
+        tx_records = transaction_cache[transaction_hash]
+    else:
+        tx_ops = (
+            horizon_server.operations()
+            .for_transaction(transaction_hash)
+            .limit(per_call_limit)
+            .order(False)
+            .call()
+        )
+        tx_records = _extract_records(tx_ops)
+        if transaction_cache is not None:
+            transaction_cache[transaction_hash] = tx_records
+    return _extract_previous_balance_id(tx_records, str(create_operation_id))
 
 
 def _extract_records(response: dict[str, Any]) -> list[dict[str, Any]]:

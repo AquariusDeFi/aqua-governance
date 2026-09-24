@@ -103,14 +103,20 @@ def _horizon(created_at):
 class _ChainHorizon:
     """
     Horizon stand-in for melting chains: each balance in `parents` was created by a service-sponsored
-    clawback→create of its parent; a balance whose parent is None is the voter's own create.
+    clawback→create of its parent; a balance whose parent is None is the voter's own create. Balances
+    listed in `transactions` share that transaction, like the melter's batched transactions.
     """
 
-    def __init__(self, parents, created_at, on_operations_call=None):
+    def __init__(self, parents, created_at, on_operations_call=None, transactions=None):
         self.parents = parents
         self.created_at = created_at
         self.on_operations_call = on_operations_call
+        self.transactions = transactions or {}
         self.operations_calls = 0
+        self.transaction_calls = 0
+
+    def transaction_hash(self, balance_id):
+        return self.transactions.get(balance_id, f'tx-{balance_id}')
 
     @classmethod
     def linear(cls, length, created_at, **kwargs):
@@ -129,7 +135,7 @@ class _ChainHorizon:
         return [{
             'id': f'create-{balance_id}',
             'type': 'create_claimable_balance',
-            'transaction_hash': f'tx-{balance_id}',
+            'transaction_hash': self.transaction_hash(balance_id),
             'created_at': self.created_at.isoformat(),
             'amount': '1000',
             'sponsor': DEFAULT_PROPOSED_BY if parent is None else SECONDARY_ACCOUNT,
@@ -137,14 +143,16 @@ class _ChainHorizon:
         }]
 
     def transaction_records(self, transaction_hash):
-        balance_id = transaction_hash[len('tx-'):]
-        records = [{'id': f'create-{balance_id}', 'type': 'create_claimable_balance'}]
-        if self.parents[balance_id] is not None:
-            records.insert(0, {
-                'id': f'clawback-{balance_id}',
-                'type': 'clawback_claimable_balance',
-                'balance_id': self.parents[balance_id],
-            })
+        self.transaction_calls += 1
+        records = []
+        for balance_id, parent in self.parents.items():
+            if self.transaction_hash(balance_id) != transaction_hash:
+                continue
+            if parent is not None:
+                records.append({
+                    'id': f'clawback-{balance_id}', 'type': 'clawback_claimable_balance', 'balance_id': parent,
+                })
+            records.append({'id': f'create-{balance_id}', 'type': 'create_claimable_balance'})
         return records
 
 
@@ -710,3 +718,58 @@ class HiddenLineageTests(TestCase):
         gone.refresh_from_db()
         self.assertEqual(live.amount, Decimal('900'))
         self.assertTrue(gone.claimed)
+
+
+class HorizonCallBudgetTests(TestCase):
+    def test_origin_found_by_the_lineage_walk_is_not_traced_again(self):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
+        stored_replacement = _raw_vote(proposal, 'a-2', amount='900')
+        unstored_replacement = _raw_vote(proposal, 'b-3', amount='800')
+        stored = _vote(
+            proposal, claimable_balance_id='a-1',
+            key=generate_vote_key(stored_replacement, proposal, LogVote.VOTE_FOR),
+        )
+        parents = {'a-1': None, 'a-2': 'a-1', 'b-0': None, 'b-1': 'b-0', 'b-2': 'b-1', 'b-3': 'b-2'}
+        horizon = _ChainHorizon(parents, proposal.end_at - timedelta(days=3))
+
+        with patch(f'{TASKS}.Server', return_value=horizon), patch(
+            f'{INDEXING}.load_all_records', side_effect=[[stored_replacement, unstored_replacement], [], []],
+        ):
+            task_sync_closed_proposal_claims()
+
+        stored.refresh_from_db()
+        self.assertEqual(stored.claimable_balance_id, 'a-2')
+        added = proposal.logvote_set.get(claimable_balance_id='b-3')
+        self.assertEqual(added.created_at, horizon.created_at)
+        # a-2: 1 step (2 calls); b-3: 3 steps back to its own create b-0 (4 balance + 3 transaction calls);
+        # b-3 metadata: 1 call for b-0's create operation, with the origin reused from the walk.
+        self.assertEqual(horizon.operations_calls, 10)
+
+    def test_batched_melt_transaction_is_loaded_once_per_snapshot(self):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
+        ice_replacement = _raw_vote(proposal, 'ice-2', asset_code=settings.GOVERNANCE_ICE_ASSET_CODE)
+        gdice_replacement = _raw_vote(proposal, 'gdice-2')
+        ice = _vote(
+            proposal, claimable_balance_id='ice-1', asset_code=settings.GOVERNANCE_ICE_ASSET_CODE,
+            key=generate_vote_key(ice_replacement, proposal, LogVote.VOTE_FOR),
+        )
+        gdice = _vote(
+            proposal, claimable_balance_id='gdice-1',
+            key=generate_vote_key(gdice_replacement, proposal, LogVote.VOTE_FOR),
+        )
+        horizon = _ChainHorizon(
+            {'ice-1': None, 'ice-2': 'ice-1', 'gdice-1': None, 'gdice-2': 'gdice-1'},
+            proposal.end_at - timedelta(days=3),
+            transactions={'ice-2': 'melt-batch', 'gdice-2': 'melt-batch'},
+        )
+
+        with patch(f'{TASKS}.Server', return_value=horizon), patch(
+            f'{INDEXING}.load_all_records', side_effect=[[ice_replacement, gdice_replacement], [], []],
+        ):
+            task_sync_closed_proposal_claims()
+
+        ice.refresh_from_db()
+        gdice.refresh_from_db()
+        self.assertEqual((ice.claimable_balance_id, gdice.claimable_balance_id), ('ice-2', 'gdice-2'))
+        self.assertEqual(horizon.transaction_calls, 1)
+        self.assertEqual(horizon.operations_calls, 3)
