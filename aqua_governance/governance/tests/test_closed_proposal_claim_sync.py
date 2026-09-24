@@ -13,10 +13,12 @@ from aqua_governance.governance.claimable_trace import find_origin_claimable_bal
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key
 from aqua_governance.governance.task_logic.unlock_rules import get_expected_unlock_timestamp
+from aqua_governance.governance.task_logic.vote_indexing import update_proposal_votes_snapshot
 from aqua_governance.governance.tasks import (
     CLOSED_PROPOSAL_CLAIM_SYNC_DELAY,
     task_retry_failed_onchain_executions,
     task_sync_closed_proposal_claims,
+    task_update_proposal_results,
 )
 from aqua_governance.governance.tests._factories import (
     DEFAULT_PROPOSED_BY,
@@ -539,3 +541,93 @@ class ClosedProposalClaimSyncLineageTests(TestCase):
 
         traced = {call.args[1] for call in origin_trace.call_args_list}
         self.assertLessEqual({'split-a', 'split-b'}, traced)
+
+
+def _soft_time_limit_on_first_horizon_call():
+    calls = []
+
+    def hook():
+        calls.append(None)
+        if len(calls) == 1:
+            raise SoftTimeLimitExceeded()
+    return hook
+
+
+class SoftTimeLimitTests(TestCase):
+    CASES = ('lineage walk', 'origin trace')
+
+    def _melted_vote(self, proposal, case):
+        """
+        A service-sponsored replacement whose first Horizon operations call happens inside the lineage
+        walk (a stored ancestor exists) or inside the full origin trace (nothing stored in its group).
+        """
+        replacement = _raw_vote(proposal, _chain_id(2))
+        key = generate_vote_key(replacement, proposal, LogVote.VOTE_FOR)
+        if case == 'lineage walk':
+            vote = _vote(proposal, claimable_balance_id=_chain_id(1), voted_amount=None, key=key)
+        else:
+            vote = _vote(proposal, claimable_balance_id='unrelated', key='unrelated-key')
+        return replacement, vote
+
+    def _horizon_patches(self, proposal, replacement, hook):
+        horizon = _ChainHorizon.linear(2, proposal.end_at - timedelta(days=3), on_operations_call=hook)
+        balances = {proposal.vote_for_issuer: [replacement]}
+        return (
+            patch(f'{TASKS}.Server', return_value=horizon),
+            patch(f'{INDEXING}.load_all_records', side_effect=_load_balances_by_claimant(balances, [])),
+        )
+
+    def test_claim_sync_run_stops_on_soft_time_limit(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                older = _closed_general(ended_ago=timedelta(days=3))
+                older_gone = _vote(older, claimable_balance_id=f'gone-{older.pk}', key='gone-key')
+                newer = _closed_general(ended_ago=timedelta(days=2))
+                replacement, _ = self._melted_vote(newer, case)
+                server_patch, records_patch = self._horizon_patches(
+                    newer, replacement, _soft_time_limit_on_first_horizon_call(),
+                )
+
+                with server_patch, records_patch, self.assertRaises(SoftTimeLimitExceeded):
+                    task_sync_closed_proposal_claims()
+
+                older_gone.refresh_from_db()
+                self.assertFalse(older_gone.claimed)
+                LogVote.objects.filter(proposal__in=[older, newer]).delete()
+
+    def test_asset_freeze_interrupted_by_soft_time_limit_is_held_for_review(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                proposal = _close(make_asset_proposal(asset_code=f'TK{next(_asset_codes)}'))
+                replacement, _ = self._melted_vote(proposal, case)
+                server_patch, records_patch = self._horizon_patches(
+                    proposal, replacement, _soft_time_limit_on_first_horizon_call(),
+                )
+
+                with server_patch, records_patch, patch(f'{TASKS}.update_proposal_final_results') as finalize:
+                    task_update_proposal_results(proposal.pk, True)
+
+                finalize.assert_not_called()
+                proposal.refresh_from_db()
+                self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW)
+                self.assertEqual(proposal.asset_token.contract_sync_status, AssetToken.CONTRACT_SYNC_REQUIRES_REVIEW)
+                LogVote.objects.filter(proposal=proposal).delete()
+
+    def test_general_freeze_interrupted_by_soft_time_limit_is_retried(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                proposal = _closed_general(ended_ago=timedelta(days=2))
+                replacement, _ = self._melted_vote(proposal, case)
+                server_patch, records_patch = self._horizon_patches(
+                    proposal, replacement, _soft_time_limit_on_first_horizon_call(),
+                )
+
+                with server_patch, records_patch, patch(
+                    f'{TASKS}.update_proposal_votes_snapshot', wraps=update_proposal_votes_snapshot,
+                ) as snapshot, patch(f'{TASKS}.update_proposal_final_results') as finalize:
+                    result = task_update_proposal_results.apply(args=(proposal.pk, True), throw=False)
+
+                self.assertTrue(result.successful())
+                self.assertEqual(snapshot.call_count, 2)
+                finalize.assert_called_once_with(proposal.pk)
+                LogVote.objects.filter(proposal=proposal).delete()

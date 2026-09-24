@@ -228,9 +228,9 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
                 horizon_server=horizon_server,
                 freezing_amount=freezing_amount,
             )
-        except IncompleteVoteSnapshot:
+        except (IncompleteVoteSnapshot, SoftTimeLimitExceeded):
             complete = False
-            logger.exception('Skip finalization of proposal %s: incomplete original vote metadata.', proposal.pk)
+            logger.exception('Skip finalization of proposal %s: vote snapshot is incomplete or timed out.', proposal.pk)
             _hold_incomplete_vote_snapshot(proposal.pk)
     return complete
 
