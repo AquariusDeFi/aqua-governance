@@ -503,19 +503,7 @@ class ClosedProposalClaimSyncLineageTests(TestCase):
                 self.assertEqual(horizon.operations_calls, 2 * steps)
                 vote.delete()
 
-    def test_late_stored_row_reached_through_the_chain_stays_excluded(self):
-        end_at = timezone.now() - timedelta(days=2)
-        horizon = _ChainHorizon.linear(self.ORIGIN_DEPTH, end_at - timedelta(days=3))
-        proposal, vote, _ = self._sync_chain(
-            self.ORIGIN_DEPTH - 1, horizon=horizon, created_at=end_at + timedelta(hours=1),
-        )
-
-        self.assertEqual(vote.claimable_balance_id, _chain_id(self.ORIGIN_DEPTH - 1))
-        self.assertEqual(vote.amount, Decimal('1000'))
-        self.assertFalse(vote.claimed)
-        self.assertEqual(proposal.logvote_set.count(), 1)
-
-    def test_late_stored_row_is_not_bypassed_by_an_on_time_origin(self):
+    def test_late_stored_row_reached_through_the_chain_stays_excluded_despite_an_on_time_origin(self):
         proposal = _closed_general(ended_ago=timedelta(days=2))
         replacement = _raw_vote(proposal, _chain_id(5))
         late = _vote(
@@ -537,7 +525,7 @@ class ClosedProposalClaimSyncLineageTests(TestCase):
         proposal = _closed_general(ended_ago=timedelta(days=2))
         first = _raw_vote(proposal, 'split-a', amount='900')
         second = _raw_vote(proposal, 'split-b', amount='800')
-        _vote(
+        stored = _vote(
             proposal, claimable_balance_id=_chain_id(3),
             key=generate_vote_key(first, proposal, LogVote.VOTE_FOR),
         )
@@ -553,6 +541,18 @@ class ClosedProposalClaimSyncLineageTests(TestCase):
 
         traced = {call.args[1] for call in origin_trace.call_args_list}
         self.assertLessEqual({'split-a', 'split-b'}, traced)
+        # Origin matching is ambiguous (two replacements, one vote), so the stored vote is paired with the
+        # largest replacement and the other one is added with its origin's creation metadata.
+        stored.refresh_from_db()
+        self.assertEqual(
+            (stored.claimable_balance_id, stored.amount, stored.voted_amount),
+            ('split-a', Decimal('900'), Decimal('1000')),
+        )
+        added = proposal.logvote_set.exclude(pk=stored.pk).get()
+        self.assertEqual(
+            (added.claimable_balance_id, added.amount, added.original_amount, added.voted_amount, added.created_at),
+            ('split-b', Decimal('800'), Decimal('1000'), None, horizon.created_at),
+        )
 
 
 def _soft_time_limit_on_first_horizon_call():
