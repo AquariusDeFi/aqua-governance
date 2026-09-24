@@ -678,3 +678,35 @@ class UnresolvableGroupTests(TestCase):
             update_proposal_votes_snapshot(proposal=self.proposal, horizon_server=self.horizon, freezing_amount=True)
 
         self.assertEqual(list(self.proposal.logvote_set.order_by('pk').values()), before)
+
+
+class HiddenLineageTests(TestCase):
+    DEPTH = 125
+
+    def test_replacement_of_a_hidden_late_vote_is_excluded_without_an_origin_trace(self):
+        proposal, live, gone, live_raw = _proposal_with_live_and_gone_votes()
+        replacement = _raw_vote(proposal, _chain_id(self.DEPTH), asset_code=settings.GOVERNANCE_ICE_ASSET_CODE)
+        hidden = _vote(
+            proposal, claimable_balance_id=_chain_id(self.DEPTH - 1), hide=True,
+            asset_code=settings.GOVERNANCE_ICE_ASSET_CODE, created_at=proposal.end_at + timedelta(hours=1),
+            key=generate_vote_key(replacement, proposal, LogVote.VOTE_FOR),
+        )
+        hidden_before = LogVote.objects.filter(pk=hidden.pk).values().get()
+        horizon = _ChainHorizon.linear(self.DEPTH, proposal.end_at + timedelta(hours=1))
+        balances = {proposal.vote_for_issuer: [live_raw, replacement]}
+
+        with patch(f'{TASKS}.Server', return_value=horizon), patch(
+            f'{INDEXING}.load_all_records', side_effect=_load_balances_by_claimant(balances, []),
+        ), patch(
+            f'{INDEXING}.find_origin_claimable_balance_id', wraps=find_origin_claimable_balance_id,
+        ) as origin_trace:
+            task_sync_closed_proposal_claims()
+
+        origin_trace.assert_not_called()
+        self.assertEqual(horizon.operations_calls, 2)
+        self.assertEqual(LogVote.objects.filter(pk=hidden.pk).values().get(), hidden_before)
+        self.assertFalse(proposal.logvote_set.filter(claimable_balance_id=replacement['id']).exists())
+        live.refresh_from_db()
+        gone.refresh_from_db()
+        self.assertEqual(live.amount, Decimal('900'))
+        self.assertTrue(gone.claimed)

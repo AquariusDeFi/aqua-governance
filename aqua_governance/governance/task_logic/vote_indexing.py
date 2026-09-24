@@ -56,6 +56,9 @@ def update_proposal_votes_snapshot(
         request_builders = _build_request_builders(proposal, horizon_server)
 
         all_votes = proposal.logvote_set.filter(hide=False)
+        hidden_balance_ids_by_key: dict[str, set[str]] = {}
+        for key, balance_id in proposal.logvote_set.filter(hide=True).values_list('key', 'claimable_balance_id'):
+            hidden_balance_ids_by_key.setdefault(key, set()).add(balance_id)
         raw_vote_groups = _build_raw_vote_groups(
             proposal=proposal,
             request_builders=request_builders,
@@ -92,6 +95,7 @@ def update_proposal_votes_snapshot(
                 horizon_server=horizon_server,
                 origin_cache=origin_cache,
                 incomplete_balance_ids=group_incomplete_balance_ids,
+                hidden_balance_ids=hidden_balance_ids_by_key.get(vote_key, set()),
             )
             if group_incomplete_balance_ids and not strict:
                 logger.warning(
@@ -238,6 +242,7 @@ def reconcile_vote_group(
     horizon_server: Optional[Server] = None,
     origin_cache: Optional[dict[str, Optional[str]]] = None,
     incomplete_balance_ids: Optional[set[str]] = None,
+    hidden_balance_ids: Optional[set[str]] = None,
 ) -> tuple[list[LogVote], list[LogVote], set[int]]:
     new_log_vote: list[LogVote] = []
     update_log_vote: list[LogVote] = []
@@ -263,11 +268,15 @@ def reconcile_vote_group(
         for vote in existing_votes
         if vote.claimable_balance_id is not None
     }
-    lineage_matches = _match_service_replacements_by_lineage(
+    lineage_matches, hidden_lineage_indexes = _match_service_replacements_by_lineage(
         horizon_server=horizon_server,
         raw_items=raw_items,
         existing_by_balance_id=existing_by_balance_id,
+        hidden_balance_ids=hidden_balance_ids or set(),
     )
+    if hidden_lineage_indexes:
+        # Replacements of hidden votes stay excluded, like the hidden votes themselves.
+        raw_items = [raw_item for raw_item in raw_items if raw_item['index'] not in hidden_lineage_indexes]
     if proposal.end_at is not None:
         eligible_raw_items = []
         for raw_item in raw_items:
@@ -440,16 +449,20 @@ def _match_service_replacements_by_lineage(
     horizon_server: Optional[Server],
     raw_items: list[dict[str, Any]],
     existing_by_balance_id: dict[str, LogVote],
-) -> dict[int, LogVote]:
+    hidden_balance_ids: set[str],
+) -> tuple[dict[int, LogVote], set[int]]:
     """
     Map service-sponsored replacements to the stored vote whose balance their replacement chain
     passes through, one to one. Replacements that share a stored vote, or whose chain does not reach
-    one, are left to origin matching.
+    one, are left to origin matching. Replacements whose chain reaches a hidden vote are returned
+    separately so they can be excluded.
     """
-    if horizon_server is None or not existing_by_balance_id:
-        return {}
+    hidden_balance_ids = hidden_balance_ids - set(existing_by_balance_id)
+    if horizon_server is None or not (existing_by_balance_id or hidden_balance_ids):
+        return {}, set()
 
-    stored_balance_ids = set(existing_by_balance_id)
+    stored_balance_ids = set(existing_by_balance_id) | hidden_balance_ids
+    hidden_indexes: set[int] = set()
     current_balance_ids = {raw_item['balance_id'] for raw_item in raw_items}
     ancestors: dict[int, str] = {}
     for raw_item in raw_items:
@@ -464,15 +477,18 @@ def _match_service_replacements_by_lineage(
             logger.warning('Lineage trace failed for balance %s; fall back to origin matching.', balance_id,
                            exc_info=True)
             continue
-        if ancestor_balance_id is not None and ancestor_balance_id not in current_balance_ids:
+        if ancestor_balance_id in hidden_balance_ids:
+            hidden_indexes.add(raw_item['index'])
+        elif ancestor_balance_id is not None and ancestor_balance_id not in current_balance_ids:
             ancestors[raw_item['index']] = ancestor_balance_id
 
     ancestor_counts = Counter(ancestors.values())
-    return {
+    lineage_matches = {
         raw_index: existing_by_balance_id[ancestor_balance_id]
         for raw_index, ancestor_balance_id in ancestors.items()
         if ancestor_counts[ancestor_balance_id] == 1
     }
+    return lineage_matches, hidden_indexes
 
 
 def _resolve_origin_balance_id(
