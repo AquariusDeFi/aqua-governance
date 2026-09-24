@@ -56,9 +56,9 @@ def update_proposal_votes_snapshot(
         request_builders = _build_request_builders(proposal, horizon_server)
 
         all_votes = proposal.logvote_set.filter(hide=False)
-        hidden_balance_ids_by_key: dict[str, set[str]] = {}
-        for key, balance_id in proposal.logvote_set.filter(hide=True).values_list('key', 'claimable_balance_id'):
-            hidden_balance_ids_by_key.setdefault(key, set()).add(balance_id)
+        hidden_votes_by_key: dict[str, list[LogVote]] = {}
+        for hidden_vote in proposal.logvote_set.filter(hide=True).only('id', 'key', 'hide', 'claimable_balance_id'):
+            hidden_votes_by_key.setdefault(hidden_vote.key, []).append(hidden_vote)
         raw_vote_groups = _build_raw_vote_groups(
             proposal=proposal,
             request_builders=request_builders,
@@ -66,6 +66,7 @@ def update_proposal_votes_snapshot(
         )
         new_log_vote: list[LogVote] = []
         update_log_vote: list[LogVote] = []
+        advanced_log_vote: list[LogVote] = []
         processed_vote_ids: set[int] = set()
         incomplete_balance_ids: set[str] = set()
         origin_cache: dict[str, Optional[str]] = {}
@@ -86,6 +87,7 @@ def update_proposal_votes_snapshot(
                 len(raw_vote_group),
             )
             group_incomplete_balance_ids: set[str] = set()
+            group_advanced_votes: list[LogVote] = []
             group_new_votes, group_updated_votes, group_processed_vote_ids = reconcile_vote_group(
                 vote_key=vote_key,
                 raw_vote_group=raw_vote_group,
@@ -96,8 +98,9 @@ def update_proposal_votes_snapshot(
                 horizon_server=horizon_server,
                 origin_cache=origin_cache,
                 incomplete_balance_ids=group_incomplete_balance_ids,
-                hidden_balance_ids=hidden_balance_ids_by_key.get(vote_key, set()),
+                hidden_votes=hidden_votes_by_key.get(vote_key, []),
                 transaction_cache=transaction_cache,
+                advanced_votes=group_advanced_votes,
             )
             if group_incomplete_balance_ids and not strict:
                 logger.warning(
@@ -112,6 +115,7 @@ def update_proposal_votes_snapshot(
             incomplete_balance_ids.update(group_incomplete_balance_ids)
             new_log_vote.extend(group_new_votes)
             update_log_vote.extend(group_updated_votes)
+            advanced_log_vote.extend(group_advanced_votes)
             processed_vote_ids.update(group_processed_vote_ids)
 
         if incomplete_balance_ids:
@@ -133,7 +137,40 @@ def update_proposal_votes_snapshot(
             # transaction and could revert a freeze committed in the meantime.
             update_fields.append("voted_amount")
         LogVote.objects.bulk_update(update_log_vote, update_fields)
+        _advance_excluded_votes(advanced_log_vote)
     return unresolved_groups
+
+
+def _advance_excluded_votes(advanced_votes: list[LogVote]) -> None:
+    """
+    Move excluded (late or hidden) votes to the current balance of their replacement chain, so the next
+    lineage walk starts there. Only the balance id and amount change; the votes stay excluded.
+    """
+    if not advanced_votes:
+        return
+    taken = set(
+        LogVote.objects.filter(
+            claimable_balance_id__in=[vote.claimable_balance_id for vote in advanced_votes],
+        ).values_list('hide', 'claimable_balance_id'),
+    )
+    movable_votes = []
+    for vote in advanced_votes:
+        if (vote.hide, vote.claimable_balance_id) in taken:
+            logger.warning(
+                'Keep excluded vote %s at its balance: %s is already stored.', vote.id, vote.claimable_balance_id,
+            )
+            continue
+        movable_votes.append(vote)
+    LogVote.objects.bulk_update(movable_votes, ['claimable_balance_id', 'amount'])
+
+
+def _advanced_vote(vote: LogVote, raw_item: dict[str, Any]) -> LogVote:
+    return LogVote(
+        id=vote.id,
+        hide=vote.hide,
+        claimable_balance_id=raw_item['balance_id'],
+        amount=raw_item['vote']['amount'],
+    )
 
 
 def _build_request_builders(proposal: Proposal, horizon_server: Server):
@@ -244,8 +281,9 @@ def reconcile_vote_group(
     horizon_server: Optional[Server] = None,
     origin_cache: Optional[dict[str, Optional[str]]] = None,
     incomplete_balance_ids: Optional[set[str]] = None,
-    hidden_balance_ids: Optional[set[str]] = None,
+    hidden_votes: Optional[list[LogVote]] = None,
     transaction_cache: Optional[dict[str, list[dict[str, Any]]]] = None,
+    advanced_votes: Optional[list[LogVote]] = None,
 ) -> tuple[list[LogVote], list[LogVote], set[int]]:
     new_log_vote: list[LogVote] = []
     update_log_vote: list[LogVote] = []
@@ -253,6 +291,8 @@ def reconcile_vote_group(
     sorted_raw_vote_group = sorted(raw_vote_group, key=lambda item: Decimal(item[1]['amount']), reverse=True)
     if origin_cache is None:
         origin_cache = {}
+    if advanced_votes is None:
+        advanced_votes = []
 
     raw_items: list[dict[str, Any]] = []
     for raw_index, (vote_choice, raw_vote) in enumerate(sorted_raw_vote_group):
@@ -271,27 +311,35 @@ def reconcile_vote_group(
         for vote in existing_votes
         if vote.claimable_balance_id is not None
     }
-    lineage_matches, hidden_lineage_indexes = _match_service_replacements_by_lineage(
+    lineage_matches, hidden_matches = _match_service_replacements_by_lineage(
         horizon_server=horizon_server,
         raw_items=raw_items,
         existing_by_balance_id=existing_by_balance_id,
-        hidden_balance_ids=hidden_balance_ids or set(),
+        hidden_by_balance_id={vote.claimable_balance_id: vote for vote in hidden_votes or []},
         origin_cache=origin_cache,
         transaction_cache=transaction_cache,
     )
-    if hidden_lineage_indexes:
-        # Replacements of hidden votes stay excluded, like the hidden votes themselves.
-        raw_items = [raw_item for raw_item in raw_items if raw_item['index'] not in hidden_lineage_indexes]
+    if hidden_matches:
+        # Hidden votes and their replacements stay excluded; a hidden vote follows its replacement.
+        for raw_item in raw_items:
+            hidden_vote = hidden_matches.get(raw_item['index'])
+            if hidden_vote is not None:
+                advanced_votes.append(_advanced_vote(hidden_vote, raw_item))
+        raw_items = [raw_item for raw_item in raw_items if raw_item['index'] not in hidden_matches]
     if proposal.end_at is not None:
         eligible_raw_items = []
         for raw_item in raw_items:
             existing_vote = existing_by_balance_id.get(raw_item['balance_id'])
+            lineage_vote = None
             if existing_vote is None:
-                existing_vote = lineage_matches.get(raw_item['index'])
+                existing_vote = lineage_vote = lineage_matches.get(raw_item['index'])
             if existing_vote is not None:
                 if existing_vote.created_at is None or existing_vote.created_at > proposal.end_at:
                     if existing_vote.created_at is None and incomplete_balance_ids is not None:
                         incomplete_balance_ids.add(raw_item['balance_id'])
+                    elif lineage_vote is not None:
+                        # A late vote follows its replacement and stays excluded.
+                        advanced_votes.append(_advanced_vote(lineage_vote, raw_item))
                     _mark_votes_as_processed([existing_vote], processed_vote_ids)
                     continue
             else:
@@ -454,27 +502,38 @@ def _match_service_replacements_by_lineage(
     horizon_server: Optional[Server],
     raw_items: list[dict[str, Any]],
     existing_by_balance_id: dict[str, LogVote],
-    hidden_balance_ids: set[str],
+    hidden_by_balance_id: dict[str, LogVote],
     origin_cache: dict[str, Optional[str]],
     transaction_cache: Optional[dict[str, list[dict[str, Any]]]] = None,
-) -> tuple[dict[int, LogVote], set[int]]:
+) -> tuple[dict[int, LogVote], dict[int, Optional[LogVote]]]:
     """
     Map service-sponsored replacements to the stored vote whose balance their replacement chain
     passes through, one to one. Replacements that share a stored vote, or whose chain does not reach
-    one, are left to origin matching. Replacements whose chain reaches a hidden vote are returned
-    separately so they can be excluded. An origin reached by the walk is recorded in origin_cache.
-    """
-    hidden_balance_ids = hidden_balance_ids - set(existing_by_balance_id)
-    if horizon_server is None or not (existing_by_balance_id or hidden_balance_ids):
-        return {}, set()
+    one, are left to origin matching. An origin reached by the walk is recorded in origin_cache.
 
-    stored_balance_ids = set(existing_by_balance_id) | hidden_balance_ids
-    hidden_indexes: set[int] = set()
+    Balances of hidden votes, and replacements whose chain reaches one, are returned separately so
+    they can be excluded, with the hidden vote a single replacement leads to.
+    """
+    hidden_by_balance_id = {
+        balance_id: vote
+        for balance_id, vote in hidden_by_balance_id.items()
+        if balance_id not in existing_by_balance_id
+    }
+    if not (existing_by_balance_id or hidden_by_balance_id):
+        return {}, {}
+
+    stored_balance_ids = set(existing_by_balance_id) | set(hidden_by_balance_id)
     current_balance_ids = {raw_item['balance_id'] for raw_item in raw_items}
     ancestors: dict[int, str] = {}
+    hidden_ancestors: dict[int, Optional[str]] = {}
     for raw_item in raw_items:
         balance_id = raw_item['balance_id']
-        if raw_item['self_sponsored'] or not balance_id or balance_id in existing_by_balance_id:
+        if not balance_id or balance_id in existing_by_balance_id:
+            continue
+        if balance_id in hidden_by_balance_id:
+            hidden_ancestors[raw_item['index']] = None
+            continue
+        if raw_item['self_sponsored'] or horizon_server is None:
             continue
         try:
             trace = trace_to_stored_ancestor(
@@ -489,8 +548,8 @@ def _match_service_replacements_by_lineage(
         if trace.origin_balance_id is not None:
             origin_cache[balance_id] = trace.origin_balance_id
         ancestor_balance_id = trace.stored_balance_id
-        if ancestor_balance_id in hidden_balance_ids:
-            hidden_indexes.add(raw_item['index'])
+        if ancestor_balance_id in hidden_by_balance_id:
+            hidden_ancestors[raw_item['index']] = ancestor_balance_id
         elif ancestor_balance_id is not None and ancestor_balance_id not in current_balance_ids:
             ancestors[raw_item['index']] = ancestor_balance_id
 
@@ -500,7 +559,12 @@ def _match_service_replacements_by_lineage(
         for raw_index, ancestor_balance_id in ancestors.items()
         if ancestor_counts[ancestor_balance_id] == 1
     }
-    return lineage_matches, hidden_indexes
+    hidden_counts = Counter(ancestor for ancestor in hidden_ancestors.values() if ancestor is not None)
+    hidden_matches = {
+        raw_index: hidden_by_balance_id[ancestor] if ancestor is not None and hidden_counts[ancestor] == 1 else None
+        for raw_index, ancestor in hidden_ancestors.items()
+    }
+    return lineage_matches, hidden_matches
 
 
 def _resolve_origin_balance_id(
