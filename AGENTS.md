@@ -327,19 +327,36 @@ updates and the final freeze at closing call it with the proposal ID.
 claimable balance with a new id) and with claims. It re-indexes proposals that
 are `VOTED`, not hidden, closed at least an hour ago (clear of the closing
 freeze and its retries), still have an unclaimed visible vote, and have
-`onchain_execution_status` `NOT_REQUIRED`, `SKIPPED` or `SUCCESS`. It calls
-`update_proposal_votes_snapshot` directly with `freezing_amount=False`, so
-frozen `voted_amount` values are kept and late votes stay excluded. It never
-recomputes results, finalizes, or puts a proposal into review: an incomplete
-snapshot or a Horizon error is logged and the proposal is retried on the next
-run. `PENDING`/`FAILED` asset proposals are excluded because
-`task_retry_failed_onchain_executions` recomputes their results from `amount`
-when `voted_amount` is `None`; `IN_PROGRESS`/`SUBMITTED` can still become
-`FAILED`, and `REQUIRES_REVIEW` is operator-owned.
+`onchain_execution_status` `NOT_REQUIRED`, `SKIPPED` or `SUCCESS`, newest first.
+It calls `update_proposal_votes_snapshot` with `freezing_amount=False`, so
+frozen `voted_amount` values are kept and late votes stay excluded, and with
+`strict=False`, so a vote group whose original metadata cannot be resolved is
+left untouched instead of blocking the whole proposal. It never recomputes
+results, finalizes, or puts a proposal into review; a Horizon error is logged
+and the proposal is retried on the next run. `PENDING`/`FAILED` asset proposals
+are excluded because `task_retry_failed_onchain_executions` recomputes their
+results from `amount` when `voted_amount` is `None`; `IN_PROGRESS`/`SUBMITTED`
+can still become `FAILED`, and `REQUIRES_REVIEW` is operator-owned. The task
+sets its own time limits (soft 270 s, hard 300 s); at the soft limit the run
+stops, the proposal in progress rolls back, and the next run continues.
+
+A melting replacement is matched by walking its clawback/create chain back to
+the first balance id stored on a vote of the same group, so the cost follows
+the melts since the last sync instead of the vote's whole history. Replacements
+of hidden votes are dropped the same way. Only when the walk reaches no stored
+balance is the replacement traced to the voter's original create.
+
+**Post-deploy catch-up:** a first pass over proposals that have not been synced
+for a while needs more Horizon calls than one run allows. After deploying, run
+`pipenv run python manage.py sync_closed_proposal_claims` once. It uses the same
+selection and per-proposal sync as the task, without a time limit, one proposal
+at a time, and prints one line per proposal (`synced (unresolved groups: N)` or
+`error: ...`). `--proposal-id` (repeatable) limits it to specific proposals.
 
 The `repair_late_vote` management command requires all writers to be paused and
-drained; `task_sync_closed_proposal_claims` writes votes, so pause its Beat entry
-and drain queued runs too before a preview or apply.
+drained. `task_sync_closed_proposal_claims` and the `sync_closed_proposal_claims`
+command write votes, so pause the task's Beat entry, drain queued runs and do not
+run the command during a preview or apply.
 
 ### Signal-Triggered
 
