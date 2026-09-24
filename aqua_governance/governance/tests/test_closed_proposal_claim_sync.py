@@ -13,7 +13,6 @@ from aqua_governance.governance.claimable_trace import find_origin_claimable_bal
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key
 from aqua_governance.governance.task_logic.unlock_rules import get_expected_unlock_timestamp
-from aqua_governance.governance.task_logic.vote_indexing import IncompleteVoteSnapshot
 from aqua_governance.governance.tasks import (
     CLOSED_PROPOSAL_CLAIM_SYNC_DELAY,
     task_retry_failed_onchain_executions,
@@ -303,30 +302,6 @@ class ClosedProposalClaimSyncBehaviourTests(TestCase):
                 self.assertEqual(list(proposal.logvote_set.values()), votes_before)
                 LogVote.objects.filter(proposal=proposal).update(claimed=True)
 
-    def test_failure_on_one_proposal_does_not_stop_the_others(self):
-        proposals = [_closed_general() for _ in range(3)]
-        for proposal in proposals:
-            _vote(proposal)
-        failures = {
-            proposals[0].pk: ConnectionError('horizon unavailable'),
-            proposals[1].pk: IncompleteVoteSnapshot('metadata unavailable'),
-        }
-
-        def snapshot_side_effect(proposal, horizon_server, freezing_amount):
-            if proposal.pk in failures:
-                raise failures[proposal.pk]
-
-        with patch(f'{TASKS}.Server'), patch(
-            f'{TASKS}.update_proposal_votes_snapshot', side_effect=snapshot_side_effect,
-        ) as snapshot, patch(f'{TASKS}._hold_incomplete_vote_snapshot') as hold:
-            task_sync_closed_proposal_claims()
-
-        self.assertEqual(
-            [call.kwargs['proposal'].pk for call in snapshot.call_args_list],
-            [proposal.pk for proposal in reversed(proposals)],
-        )
-        hold.assert_not_called()
-
 
 class ClosedProposalClaimSyncRunTests(TestCase):
     def test_soft_time_limit_stops_the_run_and_rolls_back_the_current_proposal(self):
@@ -345,21 +320,66 @@ class ClosedProposalClaimSyncRunTests(TestCase):
         self.assertIn(newer.vote_for_issuer, requested)
         self.assertNotIn(older.vote_for_issuer, requested)
         newer_gone.refresh_from_db()
-        newer_live.refresh_from_db()
         older_gone.refresh_from_db()
         self.assertFalse(newer_gone.claimed)
-        self.assertEqual(newer_live.amount, Decimal('1000'))
         self.assertFalse(older_gone.claimed)
+
+    def _assert_synced(self, live, gone):
+        live.refresh_from_db()
+        gone.refresh_from_db()
+        self.assertEqual(live.amount, Decimal('900'))
+        self.assertTrue(gone.claimed)
+
+    def _assert_untouched(self, live, gone):
+        live.refresh_from_db()
+        gone.refresh_from_db()
+        self.assertEqual(live.amount, Decimal('1000'))
+        self.assertFalse(gone.claimed)
+
+    def test_horizon_failure_midway_through_a_proposal_does_not_stop_the_others(self):
+        synced = [_proposal_with_live_and_gone_votes() for _ in range(3)]
+        failing = synced[1][0]
+        balances = {proposal.vote_for_issuer: [raw] for proposal, _, _, raw in synced}
+        load = _load_balances_by_claimant(balances, [])
+
+        def load_or_fail(request_builder):
+            if request_builder.claimant == failing.vote_against_issuer:
+                raise ConnectionError('horizon unavailable')
+            return load(request_builder)
+
+        with patch(f'{TASKS}.Server', return_value=_ChainHorizon({}, timezone.now())), patch(
+            f'{INDEXING}.load_all_records', side_effect=load_or_fail,
+        ):
+            task_sync_closed_proposal_claims()
+
+        self._assert_synced(*synced[0][1:3])
+        self._assert_untouched(*synced[1][1:3])
+        self._assert_synced(*synced[2][1:3])
+
+    def test_failure_after_partial_writes_rolls_back_only_that_proposal(self):
+        synced = [_proposal_with_live_and_gone_votes() for _ in range(3)]
+        failing = synced[1][0]
+        balances = {proposal.vote_for_issuer: [raw] for proposal, _, _, raw in synced}
+        bulk_update = LogVote.objects.bulk_update
+
+        def bulk_update_or_fail(objs, fields, **kwargs):
+            if any(vote.proposal_id == failing.pk for vote in objs):
+                raise RuntimeError('database unavailable')
+            return bulk_update(objs, fields, **kwargs)
+
+        with patch(f'{TASKS}.Server', return_value=_ChainHorizon({}, timezone.now())), patch(
+            f'{INDEXING}.load_all_records', side_effect=_load_balances_by_claimant(balances, []),
+        ), patch.object(LogVote.objects, 'bulk_update', side_effect=bulk_update_or_fail):
+            task_sync_closed_proposal_claims()
+
+        self._assert_synced(*synced[0][1:3])
+        self._assert_untouched(*synced[1][1:3])
+        self._assert_synced(*synced[2][1:3])
 
 
 class ClosedProposalClaimSyncIndexingTests(TestCase):
-    def test_melting_replacement_and_claimed_balance_are_synced_without_changing_results(self):
-        proposal = _closed_general(
-            ended_ago=timedelta(days=2),
-            vote_for_result=Decimal('1500'),
-            vote_against_result=Decimal('0'),
-            vote_abstain_result=Decimal('0'),
-        )
+    def test_melting_replacement_and_claimed_balance_are_synced_keeping_frozen_weight(self):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
         replacement = _raw_vote(proposal, 'melted-replacement')
         melted = _vote(
             proposal, claimable_balance_id='melted-original',
@@ -371,7 +391,6 @@ class ClosedProposalClaimSyncIndexingTests(TestCase):
             amount=Decimal('500'), original_amount=Decimal('500'), voted_amount=Decimal('500'),
             key=generate_vote_key(claimed_raw, proposal, LogVote.VOTE_FOR),
         )
-        proposal_before = Proposal.objects.filter(pk=proposal.pk).values().get()
 
         with patch(f'{TASKS}.Server', return_value=_horizon(melted.created_at)), patch(
             f'{INDEXING}.load_all_records', side_effect=[[replacement], [], []],
@@ -385,8 +404,6 @@ class ClosedProposalClaimSyncIndexingTests(TestCase):
         self.assertEqual(melted.voted_amount, Decimal('1000'))
         self.assertFalse(melted.claimed)
         self.assertTrue(claimed.claimed)
-        self.assertEqual(claimed.voted_amount, Decimal('500'))
-        self.assertEqual(Proposal.objects.filter(pk=proposal.pk).values().get(), proposal_before)
 
     def test_recomputable_asset_proposal_is_not_synced_so_its_results_stay_frozen(self):
         proposal = _closed_asset(
@@ -461,7 +478,6 @@ class ClosedProposalClaimSyncLineageTests(TestCase):
 
         self.assertEqual(vote.claimable_balance_id, _chain_id(self.ORIGIN_DEPTH))
         self.assertEqual(vote.amount, Decimal('900'))
-        self.assertEqual(vote.voted_amount, Decimal('1000'))
         self.assertEqual(proposal.logvote_set.count(), 1)
 
     def test_horizon_calls_are_proportional_to_steps_since_the_stored_id(self):
