@@ -7,6 +7,8 @@ from django.conf import settings
 from django.test import TestCase
 from django.utils import timezone
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key
 from aqua_governance.governance.task_logic.unlock_rules import get_expected_unlock_timestamp
@@ -185,6 +187,24 @@ def _chain_id(step):
     return f'chain-{step}'
 
 
+def _proposal_with_live_and_gone_votes():
+    proposal = _closed_general(ended_ago=timedelta(days=2))
+    live_raw = _raw_vote(proposal, f'live-{proposal.pk}', service=False)
+    live = _vote(
+        proposal, claimable_balance_id=live_raw['id'],
+        key=generate_vote_key(live_raw, proposal, LogVote.VOTE_FOR),
+    )
+    gone = _vote(proposal, claimable_balance_id=f'gone-{proposal.pk}', key='gone-key')
+    return proposal, live, gone, live_raw
+
+
+def _load_balances_by_claimant(balances, requested):
+    def load(request_builder):
+        requested.append(request_builder.claimant)
+        return balances.get(request_builder.claimant, [])
+    return load
+
+
 def _synced_proposal_ids():
     with patch(f'{TASKS}.Server'), patch(f'{TASKS}.update_proposal_votes_snapshot') as snapshot:
         task_sync_closed_proposal_claims()
@@ -200,7 +220,15 @@ class ClosedProposalClaimSyncSelectionTests(TestCase):
         succeeded = _closed_asset(Proposal.ONCHAIN_EXECUTION_SUCCESS)
         _vote(succeeded)
 
-        self.assertEqual(_synced_proposal_ids(), [general.pk, skipped.pk, succeeded.pk])
+        self.assertEqual(_synced_proposal_ids(), [succeeded.pk, skipped.pk, general.pk])
+
+    def test_newest_proposals_are_synced_first(self):
+        older = _closed_general(ended_ago=timedelta(days=30))
+        _vote(older)
+        newer = _closed_general()
+        _vote(newer)
+
+        self.assertEqual(_synced_proposal_ids(), [newer.pk, older.pk])
 
     def test_skips_proposals_without_unclaimed_visible_votes(self):
         _vote(_closed_general(), claimed=True)
@@ -294,9 +322,33 @@ class ClosedProposalClaimSyncBehaviourTests(TestCase):
 
         self.assertEqual(
             [call.kwargs['proposal'].pk for call in snapshot.call_args_list],
-            [proposal.pk for proposal in proposals],
+            [proposal.pk for proposal in reversed(proposals)],
         )
         hold.assert_not_called()
+
+
+class ClosedProposalClaimSyncRunTests(TestCase):
+    def test_soft_time_limit_stops_the_run_and_rolls_back_the_current_proposal(self):
+        older, _, older_gone, older_raw = _proposal_with_live_and_gone_votes()
+        newer, newer_live, newer_gone, newer_raw = _proposal_with_live_and_gone_votes()
+        balances = {older.vote_for_issuer: [older_raw], newer.vote_for_issuer: [newer_raw]}
+        requested = []
+
+        with patch(f'{TASKS}.Server', return_value=_ChainHorizon({}, timezone.now())), patch(
+            f'{INDEXING}.load_all_records', side_effect=_load_balances_by_claimant(balances, requested),
+        ), patch.object(
+            LogVote.objects, 'bulk_update', side_effect=SoftTimeLimitExceeded(),
+        ), self.assertRaises(SoftTimeLimitExceeded):
+            task_sync_closed_proposal_claims()
+
+        self.assertIn(newer.vote_for_issuer, requested)
+        self.assertNotIn(older.vote_for_issuer, requested)
+        newer_gone.refresh_from_db()
+        newer_live.refresh_from_db()
+        older_gone.refresh_from_db()
+        self.assertFalse(newer_gone.claimed)
+        self.assertEqual(newer_live.amount, Decimal('1000'))
+        self.assertFalse(older_gone.claimed)
 
 
 class ClosedProposalClaimSyncIndexingTests(TestCase):

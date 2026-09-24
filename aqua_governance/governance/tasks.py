@@ -7,6 +7,7 @@ from django.db import transaction
 from django.db.models import Exists, F, OuterRef
 from django.utils import timezone
 
+from celery.exceptions import SoftTimeLimitExceeded
 from stellar_sdk import Server
 from stellar_sdk.soroban_rpc import GetTransactionStatus
 
@@ -242,13 +243,15 @@ def _closed_proposals_with_unclaimed_votes(now):
         hide=False,
         end_at__lte=now - CLOSED_PROPOSAL_CLAIM_SYNC_DELAY,
         onchain_execution_status__in=CLOSED_PROPOSAL_CLAIM_SYNC_EXECUTION_STATUSES,
-    ).order_by('id')
+    ).order_by('-id')
 
 
 @celery_app.task(ignore_result=True)
 def task_sync_closed_proposal_claims():
     """
     Follow melting replacements and claims of closed proposals' votes without touching frozen results.
+
+    Newest proposals go first, so a run cut short by the soft time limit still covers the recent ones.
     """
     horizon_server = Server(settings.HORIZON_URL)
     for proposal in _closed_proposals_with_unclaimed_votes(timezone.now()):
@@ -258,6 +261,9 @@ def task_sync_closed_proposal_claims():
                 horizon_server=horizon_server,
                 freezing_amount=False,
             )
+        except SoftTimeLimitExceeded:
+            logger.warning('Claim sync stopped at closed proposal %s: soft time limit exceeded.', proposal.pk)
+            raise
         except IncompleteVoteSnapshot:
             logger.warning('Skip claim sync of closed proposal %s: incomplete original vote metadata.', proposal.pk)
         except Exception:  # noqa: B902
