@@ -220,6 +220,13 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
             complete = False
             logger.exception('Skip finalization of proposal %s: incomplete original vote metadata.', proposal.pk)
             _hold_incomplete_vote_snapshot(proposal.pk)
+        except Exception:  # noqa: B902
+            if not freezing_amount:
+                raise
+            # A freeze that did not complete leaves voted_amount unset; finalizing would count current amounts.
+            complete = False
+            logger.exception('Skip finalization of proposal %s: final vote snapshot failed.', proposal.pk)
+            _hold_incomplete_vote_snapshot(proposal.pk)
     return complete
 
 

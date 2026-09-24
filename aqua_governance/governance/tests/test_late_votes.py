@@ -383,6 +383,67 @@ class LateVoteTests(TestCase):
         proposal.refresh_from_db()
         self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW)
 
+    def test_interrupted_asset_freeze_is_held_without_finalizing(self):
+        for error in [ConnectionError('horizon unavailable'), SoftTimeLimitExceeded()]:
+            with self.subTest(error=type(error).__name__):
+                proposal = make_asset_proposal()
+                Proposal.objects.filter(pk=proposal.pk).update(end_at=self.end, proposal_status=Proposal.VOTED)
+                with patch(f'{INDEXING}.load_all_records', side_effect=error), patch(
+                    'aqua_governance.governance.tasks.Server',
+                ), patch('aqua_governance.governance.tasks.update_proposal_final_results') as finalize, patch(
+                    'aqua_governance.governance.tasks.task_execute_onchain_action_send.delay',
+                ) as enqueue:
+                    result = task_update_proposal_results.apply(args=(proposal.pk, True), throw=False)
+                    task_retry_failed_onchain_executions()
+                self.assertTrue(result.successful())
+                finalize.assert_not_called()
+                enqueue.assert_not_called()
+                proposal.refresh_from_db()
+                self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW)
+                self.assertEqual(proposal.asset_token.contract_sync_status, AssetToken.CONTRACT_SYNC_REQUIRES_REVIEW)
+
+    def test_interrupted_general_freeze_retries_and_finalizes_once(self):
+        raw = self.raw_vote('old')
+        raw['claimants'][0]['predicate']['not']['abs_before'] = str(get_expected_unlock_timestamp(self.proposal))
+        old = self.stored_vote(key=generate_vote_key(raw, self.proposal, LogVote.VOTE_FOR), voted_amount=None)
+        with patch(
+            f'{INDEXING}.load_all_records', side_effect=[ConnectionError('horizon unavailable'), [raw], [], []],
+        ), patch('aqua_governance.governance.tasks.Server'), patch(
+            'aqua_governance.governance.tasks.update_proposal_votes_snapshot',
+            wraps=update_proposal_votes_snapshot,
+        ) as snapshot, patch(
+            'aqua_governance.governance.tasks.update_proposal_final_results',
+            wraps=update_proposal_final_results,
+        ) as finalize, patch(
+            'aqua_governance.governance.task_logic.proposal_finalization._update_ice_circulating_supply',
+            return_value=True,
+        ):
+            result = task_update_proposal_results.apply(args=(self.proposal.pk, True), throw=False)
+        self.assertTrue(result.successful())
+        self.assertEqual(snapshot.call_count, 2)
+        finalize.assert_called_once_with(self.proposal.pk)
+        old.refresh_from_db()
+        self.proposal.refresh_from_db()
+        self.assertEqual(old.voted_amount, Decimal('90'))
+        self.assertEqual(self.proposal.vote_for_result, Decimal('90'))
+
+    def test_active_indexing_error_does_not_hold_or_finalize(self):
+        for error in [ConnectionError('horizon unavailable'), SoftTimeLimitExceeded()]:
+            with self.subTest(error=type(error).__name__):
+                proposal = make_asset_proposal()
+                Proposal.objects.filter(pk=proposal.pk).update(end_at=self.end, proposal_status=Proposal.VOTED)
+                before = Proposal.objects.filter(pk=proposal.pk).values().get()
+                token_before = AssetToken.objects.filter(pk=proposal.asset_token_id).values().get()
+                with patch(f'{INDEXING}.load_all_records', side_effect=error), patch(
+                    'aqua_governance.governance.tasks.Server',
+                ), patch('aqua_governance.governance.tasks.update_proposal_final_results') as finalize:
+                    result = task_update_proposal_results.apply(args=(proposal.pk,), throw=False)
+                self.assertTrue(result.failed())
+                self.assertIsInstance(result.result, type(error))
+                finalize.assert_not_called()
+                self.assertEqual(Proposal.objects.filter(pk=proposal.pk).values().get(), before)
+                self.assertEqual(AssetToken.objects.filter(pk=proposal.asset_token_id).values().get(), token_before)
+
     def test_general_incomplete_nonfinal_snapshot_does_not_retry(self):
         for status, freezing in [(Proposal.VOTING, False), (Proposal.VOTED, False), (Proposal.VOTING, True)]:
             with self.subTest(status=status, freezing=freezing):
