@@ -13,7 +13,7 @@ from aqua_governance.governance.claimable_trace import find_origin_claimable_bal
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key
 from aqua_governance.governance.task_logic.unlock_rules import get_expected_unlock_timestamp
-from aqua_governance.governance.task_logic.vote_indexing import update_proposal_votes_snapshot
+from aqua_governance.governance.task_logic.vote_indexing import IncompleteVoteSnapshot, update_proposal_votes_snapshot
 from aqua_governance.governance.tasks import (
     CLOSED_PROPOSAL_CLAIM_SYNC_DELAY,
     task_retry_failed_onchain_executions,
@@ -277,15 +277,17 @@ class ClosedProposalClaimSyncBehaviourTests(TestCase):
         ) as hold:
             task_sync_closed_proposal_claims()
 
-        snapshot.assert_called_once_with(proposal=proposal, horizon_server=server, freezing_amount=False)
+        snapshot.assert_called_once_with(
+            proposal=proposal, horizon_server=server, freezing_amount=False, strict=False,
+        )
         finalize.assert_not_called()
         hold.assert_not_called()
 
-    def test_incomplete_snapshot_leaves_finalized_asset_proposals_untouched(self):
+    def test_unresolved_group_on_finalized_asset_proposal_is_left_untouched_and_not_held(self):
         for status in (Proposal.ONCHAIN_EXECUTION_SKIPPED, Proposal.ONCHAIN_EXECUTION_SUCCESS):
             with self.subTest(status=status):
                 proposal = _closed_asset(status)
-                _vote(proposal, claimable_balance_id=f'frozen-{status}')
+                _vote(proposal, claimable_balance_id=f'frozen-{status}', key='unknown-key')
                 proposal_before = Proposal.objects.filter(pk=proposal.pk).values().get()
                 token_before = AssetToken.objects.filter(pk=proposal.asset_token_id).values().get()
                 votes_before = list(proposal.logvote_set.values())
@@ -631,3 +633,48 @@ class SoftTimeLimitTests(TestCase):
                 self.assertEqual(snapshot.call_count, 2)
                 finalize.assert_called_once_with(proposal.pk)
                 LogVote.objects.filter(proposal=proposal).delete()
+
+
+class UnresolvableGroupTests(TestCase):
+    DEPTH = 125
+
+    def setUp(self):
+        self.proposal, self.live, self.gone, live_raw = _proposal_with_live_and_gone_votes()
+        self.deep_raw = _raw_vote(self.proposal, _chain_id(self.DEPTH), asset_code=settings.GOVERNANCE_ICE_ASSET_CODE)
+        self.unresolved = _vote(
+            self.proposal, claimable_balance_id='unrelated-stored', asset_code=settings.GOVERNANCE_ICE_ASSET_CODE,
+            key=generate_vote_key(self.deep_raw, self.proposal, LogVote.VOTE_FOR),
+        )
+        self.horizon = _ChainHorizon.linear(self.DEPTH, self.proposal.end_at - timedelta(days=3))
+        balances = {self.proposal.vote_for_issuer: [live_raw, self.deep_raw]}
+        self.records_patch = patch(
+            f'{INDEXING}.load_all_records', side_effect=_load_balances_by_claimant(balances, []),
+        )
+
+    def test_unresolvable_group_is_left_untouched_while_the_rest_syncs(self):
+        with patch(f'{TASKS}.Server', return_value=self.horizon), self.records_patch:
+            task_sync_closed_proposal_claims()
+
+        self.live.refresh_from_db()
+        self.gone.refresh_from_db()
+        self.unresolved.refresh_from_db()
+        self.assertEqual(self.live.amount, Decimal('900'))
+        self.assertTrue(self.gone.claimed)
+        self.assertEqual(self.unresolved.claimable_balance_id, 'unrelated-stored')
+        self.assertFalse(self.unresolved.claimed)
+        self.assertEqual(self.proposal.logvote_set.count(), 3)
+
+    def test_non_strict_snapshot_reports_unresolved_groups(self):
+        with self.records_patch:
+            unresolved_groups = update_proposal_votes_snapshot(
+                proposal=self.proposal, horizon_server=self.horizon, strict=False,
+            )
+
+        self.assertEqual(unresolved_groups, 1)
+
+    def test_freeze_stays_strict(self):
+        before = list(self.proposal.logvote_set.order_by('pk').values())
+        with self.records_patch, self.assertRaises(IncompleteVoteSnapshot):
+            update_proposal_votes_snapshot(proposal=self.proposal, horizon_server=self.horizon, freezing_amount=True)
+
+        self.assertEqual(list(self.proposal.logvote_set.order_by('pk').values()), before)

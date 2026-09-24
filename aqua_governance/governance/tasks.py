@@ -260,12 +260,11 @@ def task_sync_closed_proposal_claims():
                 proposal=proposal,
                 horizon_server=horizon_server,
                 freezing_amount=False,
+                strict=False,
             )
         except SoftTimeLimitExceeded:
             logger.warning('Claim sync stopped at closed proposal %s: soft time limit exceeded.', proposal.pk)
             raise
-        except IncompleteVoteSnapshot:
-            logger.warning('Skip claim sync of closed proposal %s: incomplete original vote metadata.', proposal.pk)
         except Exception:  # noqa: B902
             logger.exception('Claim sync of closed proposal %s failed.', proposal.pk)
 

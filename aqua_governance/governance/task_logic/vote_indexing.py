@@ -42,7 +42,15 @@ def update_proposal_votes_snapshot(
     proposal: Proposal,
     horizon_server: Server,
     freezing_amount: bool = False,
-) -> None:
+    strict: bool = True,
+) -> int:
+    """
+    Re-index a proposal's votes from Horizon.
+
+    In strict mode, a vote group with unresolved original metadata aborts the whole snapshot with
+    IncompleteVoteSnapshot. Otherwise such a group is left untouched (no new, updated or claimed votes)
+    and the rest of the proposal is saved. Returns the number of groups left untouched.
+    """
     with transaction.atomic():
         expected_unlock_timestamp = get_expected_unlock_timestamp(proposal)
         request_builders = _build_request_builders(proposal, horizon_server)
@@ -58,6 +66,7 @@ def update_proposal_votes_snapshot(
         processed_vote_ids: set[int] = set()
         incomplete_balance_ids: set[str] = set()
         origin_cache: dict[str, Optional[str]] = {}
+        unresolved_groups = 0
 
         logger.info("Proposal %s has %s vote groups", proposal.id, len(raw_vote_groups))
 
@@ -72,6 +81,7 @@ def update_proposal_votes_snapshot(
                 len(votes),
                 len(raw_vote_group),
             )
+            group_incomplete_balance_ids: set[str] = set()
             group_new_votes, group_updated_votes, group_processed_vote_ids = reconcile_vote_group(
                 vote_key=vote_key,
                 raw_vote_group=raw_vote_group,
@@ -81,8 +91,19 @@ def update_proposal_votes_snapshot(
                 freezing_amount=freezing_amount,
                 horizon_server=horizon_server,
                 origin_cache=origin_cache,
-                incomplete_balance_ids=incomplete_balance_ids,
+                incomplete_balance_ids=group_incomplete_balance_ids,
             )
+            if group_incomplete_balance_ids and not strict:
+                logger.warning(
+                    "Proposal %s vote_key %s left untouched: unresolved original vote metadata %s",
+                    proposal.id,
+                    vote_key,
+                    sorted(group_incomplete_balance_ids),
+                )
+                unresolved_groups += 1
+                processed_vote_ids.update(vote.id for vote in votes)
+                continue
+            incomplete_balance_ids.update(group_incomplete_balance_ids)
             new_log_vote.extend(group_new_votes)
             update_log_vote.extend(group_updated_votes)
             processed_vote_ids.update(group_processed_vote_ids)
@@ -106,6 +127,7 @@ def update_proposal_votes_snapshot(
             # transaction and could revert a freeze committed in the meantime.
             update_fields.append("voted_amount")
         LogVote.objects.bulk_update(update_log_vote, update_fields)
+    return unresolved_groups
 
 
 def _build_request_builders(proposal: Proposal, horizon_server: Server):
