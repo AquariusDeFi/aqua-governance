@@ -1,5 +1,6 @@
 import logging
 import sys
+from collections import Counter
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -7,12 +8,13 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from celery.exceptions import SoftTimeLimitExceeded
 from dateutil.parser import parse as date_parse
 from requests.exceptions import RequestException
 from stellar_sdk import Server
 from stellar_sdk.exceptions import BaseRequestError, NotFoundError
 
-from aqua_governance.governance.claimable_trace import find_origin_claimable_balance_id
+from aqua_governance.governance.claimable_trace import find_origin_claimable_balance_id, find_stored_ancestor_balance_id
 from aqua_governance.governance.exceptions import ClaimableBalanceParsingError, GenerateGrouKeyException
 from aqua_governance.governance.models import LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key, is_supported_vote_asset, parse_vote
@@ -239,10 +241,17 @@ def reconcile_vote_group(
         for vote in existing_votes
         if vote.claimable_balance_id is not None
     }
+    lineage_matches = _match_service_replacements_by_lineage(
+        horizon_server=horizon_server,
+        raw_items=raw_items,
+        existing_by_balance_id=existing_by_balance_id,
+    )
     if proposal.end_at is not None:
         eligible_raw_items = []
         for raw_item in raw_items:
             existing_vote = existing_by_balance_id.get(raw_item['balance_id'])
+            if existing_vote is None:
+                existing_vote = lineage_matches.get(raw_item['index'])
             if existing_vote is not None:
                 if existing_vote.created_at is None or existing_vote.created_at > proposal.end_at:
                     if existing_vote.created_at is None and incomplete_balance_ids is not None:
@@ -293,6 +302,16 @@ def reconcile_vote_group(
         balance_id = raw_item["balance_id"]
         existing_vote = existing_by_balance_id.get(balance_id)
         if existing_vote is None:
+            continue
+        if existing_vote.id is None or existing_vote.id in matched_existing_ids:
+            continue
+        _apply_update(existing_vote, raw_item)
+        matched_existing_ids.add(existing_vote.id)
+        matched_raw_indexes.add(raw_item["index"])
+
+    for raw_item in raw_items:
+        existing_vote = lineage_matches.get(raw_item["index"])
+        if existing_vote is None or raw_item["index"] in matched_raw_indexes:
             continue
         if existing_vote.id is None or existing_vote.id in matched_existing_ids:
             continue
@@ -393,6 +412,45 @@ def reconcile_vote_group(
             logger.warning('Balance info skipped.', exc_info=sys.exc_info())
 
     return new_log_vote, update_log_vote, processed_vote_ids
+
+
+def _match_service_replacements_by_lineage(
+    horizon_server: Optional[Server],
+    raw_items: list[dict[str, Any]],
+    existing_by_balance_id: dict[str, LogVote],
+) -> dict[int, LogVote]:
+    """
+    Map service-sponsored replacements to the stored vote whose balance their replacement chain
+    passes through, one to one. Replacements that share a stored vote, or whose chain does not reach
+    one, are left to origin matching.
+    """
+    if horizon_server is None or not existing_by_balance_id:
+        return {}
+
+    stored_balance_ids = set(existing_by_balance_id)
+    current_balance_ids = {raw_item['balance_id'] for raw_item in raw_items}
+    ancestors: dict[int, str] = {}
+    for raw_item in raw_items:
+        balance_id = raw_item['balance_id']
+        if raw_item['self_sponsored'] or not balance_id or balance_id in existing_by_balance_id:
+            continue
+        try:
+            ancestor_balance_id = find_stored_ancestor_balance_id(horizon_server, balance_id, stored_balance_ids)
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception:  # noqa: B902
+            logger.warning('Lineage trace failed for balance %s; fall back to origin matching.', balance_id,
+                           exc_info=True)
+            continue
+        if ancestor_balance_id is not None and ancestor_balance_id not in current_balance_ids:
+            ancestors[raw_item['index']] = ancestor_balance_id
+
+    ancestor_counts = Counter(ancestors.values())
+    return {
+        raw_index: existing_by_balance_id[ancestor_balance_id]
+        for raw_index, ancestor_balance_id in ancestors.items()
+        if ancestor_counts[ancestor_balance_id] == 1
+    }
 
 
 def _resolve_origin_balance_id(

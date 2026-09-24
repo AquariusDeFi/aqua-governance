@@ -155,6 +155,59 @@ def find_origin_claimable_balance_id(
     return None
 
 
+def find_stored_ancestor_balance_id(
+    horizon_server: Server,
+    start_balance_id: str,
+    stored_balance_ids: set[str],
+    *,
+    max_depth: int = 120,
+    per_call_limit: int = 200,
+) -> Optional[str]:
+    """
+    Trace claimable-balance replacement chain backwards from start_balance_id until the first
+    previous balance id that is in stored_balance_ids.
+
+    Returns that balance id, or None when the chain reaches the voter's own create operation,
+    cannot be followed, or exceeds max_depth first.
+    """
+    current_balance_id = start_balance_id
+    for _ in range(max_depth):
+        previous_balance_id = _load_previous_balance_id(horizon_server, current_balance_id, per_call_limit)
+        if previous_balance_id is None:
+            return None
+        if previous_balance_id in stored_balance_ids:
+            return previous_balance_id
+        current_balance_id = previous_balance_id
+    return None
+
+
+def _load_previous_balance_id(horizon_server: Server, balance_id: str, per_call_limit: int) -> Optional[str]:
+    balance_ops = (
+        horizon_server.operations()
+        .for_claimable_balance(balance_id)
+        .limit(per_call_limit)
+        .order(False)
+        .call()
+    )
+    create_op = _extract_single_create_op(_extract_records(balance_ops))
+    if create_op is None or _sponsor_in_claimant_destinations(create_op):
+        return None
+
+    transaction_hash = create_op.get("transaction_hash")
+    create_operation_id = create_op.get("id")
+    if transaction_hash is None or create_operation_id is None:
+        return None
+
+    tx_ops = (
+        horizon_server.operations()
+        .for_transaction(str(transaction_hash))
+        .limit(per_call_limit)
+        .order(False)
+        .call()
+    )
+    return _extract_previous_balance_id(_extract_records(tx_ops), str(create_operation_id))
+
+
 def _extract_records(response: dict[str, Any]) -> list[dict[str, Any]]:
     return list(response.get("_embedded", {}).get("records", []))
 

@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from celery.exceptions import SoftTimeLimitExceeded
 
+from aqua_governance.governance.claimable_trace import find_origin_claimable_balance_id
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
 from aqua_governance.governance.parser import generate_vote_key
 from aqua_governance.governance.task_logic.unlock_rules import get_expected_unlock_timestamp
@@ -435,3 +436,90 @@ class ClosedProposalClaimSyncIndexingTests(TestCase):
         vote.refresh_from_db()
         self.assertEqual(vote.claimable_balance_id, _chain_id(2))
         self.assertEqual(vote.voted_amount, Decimal('777'))
+
+
+class ClosedProposalClaimSyncLineageTests(TestCase):
+    ORIGIN_DEPTH = 130
+
+    def _sync_chain(self, stored_step, horizon=None, **vote_fields):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
+        replacement = _raw_vote(proposal, _chain_id(self.ORIGIN_DEPTH))
+        vote = _vote(
+            proposal, claimable_balance_id=_chain_id(stored_step),
+            key=generate_vote_key(replacement, proposal, LogVote.VOTE_FOR), **vote_fields,
+        )
+        horizon = horizon or _ChainHorizon.linear(self.ORIGIN_DEPTH, proposal.end_at - timedelta(days=3))
+        with patch(f'{TASKS}.Server', return_value=horizon), patch(
+            f'{INDEXING}.load_all_records', side_effect=[[replacement], [], []],
+        ):
+            task_sync_closed_proposal_claims()
+        vote.refresh_from_db()
+        return proposal, vote, horizon
+
+    def test_replacement_is_matched_through_the_stored_id_beyond_the_origin_trace_depth(self):
+        proposal, vote, _ = self._sync_chain(self.ORIGIN_DEPTH - 1)
+
+        self.assertEqual(vote.claimable_balance_id, _chain_id(self.ORIGIN_DEPTH))
+        self.assertEqual(vote.amount, Decimal('900'))
+        self.assertEqual(vote.voted_amount, Decimal('1000'))
+        self.assertEqual(proposal.logvote_set.count(), 1)
+
+    def test_horizon_calls_are_proportional_to_steps_since_the_stored_id(self):
+        for steps in (1, 3, 7):
+            with self.subTest(steps=steps):
+                _, vote, horizon = self._sync_chain(self.ORIGIN_DEPTH - steps)
+
+                self.assertEqual(vote.claimable_balance_id, _chain_id(self.ORIGIN_DEPTH))
+                self.assertEqual(horizon.operations_calls, 2 * steps)
+                vote.delete()
+
+    def test_late_stored_row_reached_through_the_chain_stays_excluded(self):
+        end_at = timezone.now() - timedelta(days=2)
+        horizon = _ChainHorizon.linear(self.ORIGIN_DEPTH, end_at - timedelta(days=3))
+        proposal, vote, _ = self._sync_chain(
+            self.ORIGIN_DEPTH - 1, horizon=horizon, created_at=end_at + timedelta(hours=1),
+        )
+
+        self.assertEqual(vote.claimable_balance_id, _chain_id(self.ORIGIN_DEPTH - 1))
+        self.assertEqual(vote.amount, Decimal('1000'))
+        self.assertFalse(vote.claimed)
+        self.assertEqual(proposal.logvote_set.count(), 1)
+
+    def test_late_stored_row_is_not_bypassed_by_an_on_time_origin(self):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
+        replacement = _raw_vote(proposal, _chain_id(5))
+        late = _vote(
+            proposal, claimable_balance_id=_chain_id(4), created_at=proposal.end_at + timedelta(hours=1),
+            key=generate_vote_key(replacement, proposal, LogVote.VOTE_FOR),
+        )
+        horizon = _ChainHorizon.linear(5, proposal.end_at - timedelta(days=3))
+        with patch(f'{TASKS}.Server', return_value=horizon), patch(
+            f'{INDEXING}.load_all_records', side_effect=[[replacement], [], []],
+        ):
+            task_sync_closed_proposal_claims()
+
+        late.refresh_from_db()
+        self.assertEqual(late.claimable_balance_id, _chain_id(4))
+        self.assertFalse(late.claimed)
+        self.assertEqual(proposal.logvote_set.count(), 1)
+
+    def test_replacements_reaching_the_same_stored_row_fall_back_to_origin_matching(self):
+        proposal = _closed_general(ended_ago=timedelta(days=2))
+        first = _raw_vote(proposal, 'split-a', amount='900')
+        second = _raw_vote(proposal, 'split-b', amount='800')
+        _vote(
+            proposal, claimable_balance_id=_chain_id(3),
+            key=generate_vote_key(first, proposal, LogVote.VOTE_FOR),
+        )
+        horizon = _ChainHorizon.linear(3, proposal.end_at - timedelta(days=3))
+        horizon.parents.update({'split-a': _chain_id(3), 'split-b': _chain_id(3)})
+
+        with patch(f'{TASKS}.Server', return_value=horizon), patch(
+            f'{INDEXING}.load_all_records', side_effect=[[first, second], [], []],
+        ), patch(
+            f'{INDEXING}.find_origin_claimable_balance_id', wraps=find_origin_claimable_balance_id,
+        ) as origin_trace:
+            task_sync_closed_proposal_claims()
+
+        traced = {call.args[1] for call in origin_trace.call_args_list}
+        self.assertLessEqual({'split-a', 'split-b'}, traced)
