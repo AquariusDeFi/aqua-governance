@@ -98,10 +98,12 @@ def update_proposal_votes_snapshot(
             LogVote.objects.filter(id__in=stale_vote_ids).update(claimed=True)
 
         LogVote.objects.bulk_create(new_log_vote)
-        LogVote.objects.bulk_update(
-            update_log_vote,
-            ["group_index", "claimable_balance_id", "amount", "voted_amount", "transaction_link", "claimed"],
-        )
+        update_fields = ['group_index', 'claimable_balance_id', 'amount', 'transaction_link', 'claimed']
+        # Only the freeze writes voted_amount; a non-freezing run holds a value read before it started
+        # and must not overwrite a freeze committed in the meantime.
+        if freezing_amount:
+            update_fields.append('voted_amount')
+        LogVote.objects.bulk_update(update_log_vote, update_fields)
 
 
 def _build_request_builders(proposal: Proposal, horizon_server: Server):

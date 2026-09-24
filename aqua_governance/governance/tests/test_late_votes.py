@@ -11,6 +11,7 @@ from rest_framework.test import APIClient
 from requests.exceptions import ConnectionError
 
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
+from aqua_governance.governance.parser import generate_vote_key
 from aqua_governance.governance.task_logic.proposal_finalization import (
     _sum_votes_for_proposal,
     update_proposal_final_results,
@@ -140,6 +141,27 @@ class LateVoteTests(TestCase):
             with patch(f'{INDEXING}.load_all_records', side_effect=[[raw], [], []]):
                 update_proposal_votes_snapshot(self.proposal, server)
         self.assertEqual(list(self.proposal.logvote_set.values_list('pk', 'hide')), [(late.pk, True)])
+
+    def test_active_snapshot_does_not_revert_a_freeze_committed_during_the_run(self):
+        raw_old, raw_new = self.raw_vote('old'), self.raw_vote('new')
+        for raw in (raw_old, raw_new):
+            raw['claimants'][0]['predicate']['not']['abs_before'] = str(get_expected_unlock_timestamp(self.proposal))
+        old = self.stored_vote(key=generate_vote_key(raw_old, self.proposal, LogVote.VOTE_FOR), voted_amount=None)
+        server = self.server(self.end.isoformat())
+        metadata_call = server.operations.return_value.for_claimable_balance.return_value.order.return_value.limit.return_value.call  # noqa: E501
+        metadata = metadata_call.return_value
+
+        def freeze_commits(*args, **kwargs):
+            LogVote.objects.filter(pk=old.pk).update(voted_amount=Decimal('90'))
+            return metadata
+
+        metadata_call.side_effect = freeze_commits
+        with patch(f'{INDEXING}.load_all_records', side_effect=[[raw_old, raw_new], [], []]):
+            update_proposal_votes_snapshot(self.proposal, server)
+        metadata_call.assert_called_once()
+        old.refresh_from_db()
+        self.assertEqual(old.voted_amount, Decimal('90'))
+        self.assertTrue(self.proposal.logvote_set.filter(claimable_balance_id='new', voted_amount=None).exists())
 
     def test_no_deadline_preserves_legacy_metadata_fallback(self):
         self.proposal.end_at = None
