@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from rest_framework.test import APIClient
 
+from celery.exceptions import SoftTimeLimitExceeded
 from requests.exceptions import ConnectionError
 
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
@@ -162,6 +163,33 @@ class LateVoteTests(TestCase):
         old.refresh_from_db()
         self.assertEqual(old.voted_amount, Decimal('90'))
         self.assertTrue(self.proposal.logvote_set.filter(claimable_balance_id='new', voted_amount=None).exists())
+
+    def test_soft_time_limit_is_not_swallowed_by_horizon_lookups(self):
+        old = self.stored_vote()
+        with patch(
+            f'{INDEXING}.find_origin_claimable_balance_id', side_effect=SoftTimeLimitExceeded(),
+        ), self.assertRaises(SoftTimeLimitExceeded):
+            reconcile_vote_group(
+                'key', [(LogVote.VOTE_FOR, self.raw_vote(service=True))], [old],
+                self.proposal.logvote_set.all(), self.proposal, False, horizon_server=Mock(),
+            )
+
+        self.proposal.end_at = None
+        empty = {'_embedded': {'records': []}}
+        for service, call_side_effect in [
+            (False, SoftTimeLimitExceeded()),
+            (True, [empty, SoftTimeLimitExceeded()]),
+        ]:
+            with self.subTest(service=service):
+                server = Mock()
+                server.operations.return_value.for_claimable_balance.return_value.order.return_value.limit.return_value.call.side_effect = call_side_effect  # noqa: E501
+                with patch(
+                    f'{INDEXING}.find_origin_claimable_balance_id', return_value='original',
+                ), self.assertRaises(SoftTimeLimitExceeded):
+                    _make_new_vote(
+                        'key', 0, self.raw_vote(service=service), self.proposal, LogVote.VOTE_FOR, False,
+                        horizon_server=server, restore_from_origin=service,
+                    )
 
     def test_no_deadline_preserves_legacy_metadata_fallback(self):
         self.proposal.end_at = None
