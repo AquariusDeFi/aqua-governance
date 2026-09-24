@@ -1,9 +1,11 @@
 from datetime import timedelta
 from decimal import Decimal
+from io import StringIO
 from itertools import count
 from unittest.mock import Mock, patch
 
 from django.conf import settings
+from django.core.management import call_command
 from django.test import TestCase
 from django.utils import timezone
 
@@ -773,3 +775,65 @@ class HorizonCallBudgetTests(TestCase):
         self.assertEqual((ice.claimable_balance_id, gdice.claimable_balance_id), ('ice-2', 'gdice-2'))
         self.assertEqual(horizon.transaction_calls, 1)
         self.assertEqual(horizon.operations_calls, 3)
+
+
+class SyncClosedProposalClaimsCommandTests(TestCase):
+    DEPTH = 125
+
+    def setUp(self):
+        self.failing, self.failing_live, _, failing_raw = _proposal_with_live_and_gone_votes()
+        self.unresolved, _, _, unresolved_raw = _proposal_with_live_and_gone_votes()
+        deep_raw = _raw_vote(self.unresolved, _chain_id(self.DEPTH), asset_code=settings.GOVERNANCE_ICE_ASSET_CODE)
+        _vote(
+            self.unresolved, claimable_balance_id='unrelated-stored', asset_code=settings.GOVERNANCE_ICE_ASSET_CODE,
+            key=generate_vote_key(deep_raw, self.unresolved, LogVote.VOTE_FOR),
+        )
+        self.synced, self.synced_live, self.synced_gone, synced_raw = _proposal_with_live_and_gone_votes()
+        self.voting = _closed_general(status=Proposal.VOTING)
+        _vote(self.voting)
+        balances = {
+            self.failing.vote_for_issuer: [failing_raw],
+            self.unresolved.vote_for_issuer: [unresolved_raw, deep_raw],
+            self.synced.vote_for_issuer: [synced_raw],
+        }
+        load = _load_balances_by_claimant(balances, [])
+
+        def load_or_fail(request_builder):
+            if request_builder.claimant == self.failing.vote_for_issuer:
+                raise ConnectionError('horizon unavailable')
+            return load(request_builder)
+
+        self.horizon = _ChainHorizon.linear(self.DEPTH, self.synced.end_at - timedelta(days=3))
+        self.load_or_fail = load_or_fail
+
+    def _call(self, *args):
+        stdout = StringIO()
+        with patch(
+            'aqua_governance.governance.management.commands.sync_closed_proposal_claims.Server',
+            return_value=self.horizon,
+        ), patch(f'{INDEXING}.load_all_records', side_effect=self.load_or_fail):
+            call_command('sync_closed_proposal_claims', *args, stdout=stdout)
+        return stdout.getvalue().splitlines()
+
+    def test_reports_every_selected_proposal_newest_first(self):
+        self.assertEqual(self._call(), [
+            f'proposal {self.synced.pk}: synced (unresolved groups: 0)',
+            f'proposal {self.unresolved.pk}: synced (unresolved groups: 1)',
+            f"proposal {self.failing.pk}: error: ConnectionError('horizon unavailable')",
+        ])
+        self.synced_live.refresh_from_db()
+        self.synced_gone.refresh_from_db()
+        self.failing_live.refresh_from_db()
+        self.assertEqual(self.synced_live.amount, Decimal('900'))
+        self.assertTrue(self.synced_gone.claimed)
+        self.assertEqual(self.failing_live.amount, Decimal('1000'))
+
+    def test_requested_proposals_go_through_the_task_selection(self):
+        lines = self._call('--proposal-id', str(self.unresolved.pk), '--proposal-id', str(self.voting.pk))
+
+        self.assertEqual(lines, [
+            f'proposal {self.unresolved.pk}: synced (unresolved groups: 1)',
+            f'proposal {self.voting.pk}: not selected',
+        ])
+        self.synced_live.refresh_from_db()
+        self.assertEqual(self.synced_live.amount, Decimal('1000'))

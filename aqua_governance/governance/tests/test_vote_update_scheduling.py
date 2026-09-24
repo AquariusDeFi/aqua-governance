@@ -6,7 +6,11 @@ from django.test import SimpleTestCase, TestCase
 from celery.schedules import crontab
 
 from aqua_governance.governance.models import Proposal
-from aqua_governance.governance.tasks import task_update_proposal_results, task_update_votes
+from aqua_governance.governance.tasks import (
+    task_sync_closed_proposal_claims,
+    task_update_proposal_results,
+    task_update_votes,
+)
 from aqua_governance.governance.tests._factories import _create_proposal
 from aqua_governance.taskapp import setup_periodic_tasks
 
@@ -43,6 +47,12 @@ class VoteUpdateSchedulingTests(SimpleTestCase):
         )
         self.assertEqual(
             scheduled[f'{TASKS}.task_sync_closed_proposal_claims']['schedule'], crontab(minute='*/10'),
+        )
+
+    def test_closed_proposal_claim_sync_overrides_the_worker_time_limits(self):
+        self.assertEqual(
+            (task_sync_closed_proposal_claims.soft_time_limit, task_sync_closed_proposal_claims.time_limit),
+            (270, 300),
         )
 
 

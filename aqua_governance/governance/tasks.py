@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 # Keeps the claim sync clear of the closing freeze and its retries.
 CLOSED_PROPOSAL_CLAIM_SYNC_DELAY = timedelta(hours=1)
+# Overrides the workers' 60 s soft limit; each run stops at the soft limit and the next one continues.
+CLOSED_PROPOSAL_CLAIM_SYNC_SOFT_TIME_LIMIT = 270
+CLOSED_PROPOSAL_CLAIM_SYNC_TIME_LIMIT = 300
 # Execution statuses whose stored results are never recomputed. PENDING/FAILED results are recomputed by
 # task_retry_failed_onchain_executions from `amount` when `voted_amount` is None, IN_PROGRESS/SUBMITTED can
 # still become FAILED, and REQUIRES_REVIEW is operator-owned.
@@ -235,7 +238,7 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
     return complete
 
 
-def _closed_proposals_with_unclaimed_votes(now):
+def closed_proposals_with_unclaimed_votes(now):
     unclaimed_votes = LogVote.objects.filter(proposal=OuterRef('pk'), hide=False, claimed=False)
     return Proposal.objects.filter(
         Exists(unclaimed_votes),
@@ -246,27 +249,47 @@ def _closed_proposals_with_unclaimed_votes(now):
     ).order_by('-id')
 
 
-@celery_app.task(ignore_result=True)
+def sync_closed_proposal_claim_state(proposal: Proposal, horizon_server: Server) -> int:
+    """
+    Follow melting replacements and claims of a closed proposal's votes without touching frozen results.
+
+    Returns the number of vote groups left untouched because their original metadata is unresolved.
+    """
+    return update_proposal_votes_snapshot(
+        proposal=proposal,
+        horizon_server=horizon_server,
+        freezing_amount=False,
+        strict=False,
+    )
+
+
+@celery_app.task(
+    ignore_result=True,
+    soft_time_limit=CLOSED_PROPOSAL_CLAIM_SYNC_SOFT_TIME_LIMIT,
+    time_limit=CLOSED_PROPOSAL_CLAIM_SYNC_TIME_LIMIT,
+)
 def task_sync_closed_proposal_claims():
     """
-    Follow melting replacements and claims of closed proposals' votes without touching frozen results.
+    Sync the claim state of closed proposals' votes.
 
     Newest proposals go first, so a run cut short by the soft time limit still covers the recent ones.
     """
     horizon_server = Server(settings.HORIZON_URL)
-    for proposal in _closed_proposals_with_unclaimed_votes(timezone.now()):
+    for proposal in closed_proposals_with_unclaimed_votes(timezone.now()):
         try:
-            update_proposal_votes_snapshot(
-                proposal=proposal,
-                horizon_server=horizon_server,
-                freezing_amount=False,
-                strict=False,
-            )
+            unresolved_groups = sync_closed_proposal_claim_state(proposal, horizon_server)
         except SoftTimeLimitExceeded:
             logger.warning('Claim sync stopped at closed proposal %s: soft time limit exceeded.', proposal.pk)
             raise
         except Exception:  # noqa: B902
             logger.exception('Claim sync of closed proposal %s failed.', proposal.pk)
+            continue
+        if unresolved_groups:
+            logger.warning(
+                'Claim sync of closed proposal %s left %s vote groups with unresolved metadata untouched.',
+                proposal.pk,
+                unresolved_groups,
+            )
 
 
 @celery_app.task(ignore_result=True)
