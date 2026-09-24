@@ -343,8 +343,11 @@ stops, the proposal in progress rolls back, and the next run continues.
 A melting replacement is matched by walking its clawback/create chain back to
 the first balance id stored on a vote of the same group, so the cost follows
 the melts since the last sync instead of the vote's whole history. Replacements
-of hidden votes are dropped the same way. Only when the walk reaches no stored
-balance is the replacement traced to the voter's original create.
+of hidden votes are dropped the same way. A late or hidden vote reached this way
+takes the replacement's balance id and amount (nothing else), so it stays
+excluded and the next walk starts from its current balance. Only when the walk
+reaches no stored balance is the replacement traced to the voter's original
+create.
 
 **Post-deploy catch-up:** a first pass over proposals that have not been synced
 for a while needs more Horizon calls than one run allows. After deploying, run
@@ -352,6 +355,8 @@ for a while needs more Horizon calls than one run allows. After deploying, run
 selection and per-proposal sync as the task, without a time limit, one proposal
 at a time, and prints one line per proposal (`synced (unresolved groups: N)` or
 `error: ...`). `--proposal-id` (repeatable) limits it to specific proposals.
+Pause the `task_sync_closed_proposal_claims` Beat entry while the command runs;
+otherwise both work on the same newest proposals at once.
 
 The `repair_late_vote` management command requires all writers to be paused and
 drained. `task_sync_closed_proposal_claims` and the `sync_closed_proposal_claims`
