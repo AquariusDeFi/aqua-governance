@@ -163,13 +163,13 @@ def task_update_proposal_results(self, proposal_id: int, freezing_amount: bool =
             proposal_status=Proposal.VOTED,
         ).exists():
             raise self.retry(exc=IncompleteVoteSnapshot(
-                f'Proposal {proposal_id} final vote snapshot has incomplete original metadata.',
+                f'Proposal {proposal_id} final vote snapshot failed.',
             ))
         return
     update_proposal_final_results(proposal_id)
 
 
-def _hold_incomplete_vote_snapshot(proposal_id: int) -> None:
+def _hold_incomplete_vote_snapshot(proposal_id: int, cause: str) -> None:
     with transaction.atomic():
         proposal = Proposal.objects.select_for_update().filter(
             pk=proposal_id, proposal_status=Proposal.VOTED,
@@ -191,7 +191,7 @@ def _hold_incomplete_vote_snapshot(proposal_id: int) -> None:
         if proposal.asset_token_id:
             AssetToken.objects.filter(pk=proposal.asset_token_id, contract_sync_tx_hash__isnull=True).update(
                 contract_sync_status=AssetToken.CONTRACT_SYNC_REQUIRES_REVIEW,
-                contract_sync_error=f'Proposal {proposal.pk} has incomplete original vote metadata; review required.',
+                contract_sync_error=f'Proposal {proposal.pk} vote snapshot failed ({cause}); review required.',
                 contract_sync_updated_at=timezone.now(),
             )
 
@@ -219,14 +219,15 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
         except IncompleteVoteSnapshot:
             complete = False
             logger.exception('Skip finalization of proposal %s: incomplete original vote metadata.', proposal.pk)
-            _hold_incomplete_vote_snapshot(proposal.pk)
-        except Exception:  # noqa: B902
+            _hold_incomplete_vote_snapshot(proposal.pk, 'incomplete original vote metadata')
+        except Exception as error:  # noqa: B902
             if not freezing_amount:
                 raise
             # A freeze that did not complete leaves voted_amount unset; finalizing would count current amounts.
             complete = False
             logger.exception('Skip finalization of proposal %s: final vote snapshot failed.', proposal.pk)
-            _hold_incomplete_vote_snapshot(proposal.pk)
+            # Class name only: the field is shown in admin and must not carry exception details.
+            _hold_incomplete_vote_snapshot(proposal.pk, type(error).__name__)
     return complete
 
 

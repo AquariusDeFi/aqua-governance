@@ -281,6 +281,11 @@ class LateVoteTests(TestCase):
                 proposal.refresh_from_db()
                 self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW)
                 self.assertEqual(proposal.asset_token.contract_sync_status, AssetToken.CONTRACT_SYNC_REQUIRES_REVIEW)
+                self.assertEqual(
+                    proposal.asset_token.contract_sync_error,
+                    f'Proposal {proposal.pk} vote snapshot failed '
+                    '(incomplete original vote metadata); review required.',
+                )
 
     def test_incomplete_snapshot_preserves_submitted_success_and_execution_markers(self):
         for status, fields in [
@@ -359,15 +364,18 @@ class LateVoteTests(TestCase):
         self.assertEqual(self.proposal.vote_against_result, Decimal('90'))
 
     def test_general_final_snapshot_retry_exhaustion_fails_without_finalizing(self):
-        with patch('aqua_governance.governance.tasks.Server'), patch(
-            'aqua_governance.governance.tasks.update_proposal_votes_snapshot',
-            side_effect=IncompleteVoteSnapshot('metadata unavailable'),
-        ) as snapshot, patch('aqua_governance.governance.tasks.update_proposal_final_results') as finalize:
-            result = task_update_proposal_results.apply(args=(self.proposal.pk, True), throw=False)
-        self.assertTrue(result.failed())
-        self.assertIsInstance(result.result, IncompleteVoteSnapshot)
-        self.assertEqual(snapshot.call_count, task_update_proposal_results.max_retries + 1)
-        finalize.assert_not_called()
+        for error in [IncompleteVoteSnapshot('metadata unavailable'), ConnectionError('horizon unavailable')]:
+            with self.subTest(error=type(error).__name__):
+                with patch('aqua_governance.governance.tasks.Server'), patch(
+                    'aqua_governance.governance.tasks.update_proposal_votes_snapshot',
+                    side_effect=error,
+                ) as snapshot, patch('aqua_governance.governance.tasks.update_proposal_final_results') as finalize:
+                    result = task_update_proposal_results.apply(args=(self.proposal.pk, True), throw=False)
+                self.assertTrue(result.failed())
+                self.assertIsInstance(result.result, IncompleteVoteSnapshot)
+                self.assertEqual(str(result.result), f'Proposal {self.proposal.pk} final vote snapshot failed.')
+                self.assertEqual(snapshot.call_count, task_update_proposal_results.max_retries + 1)
+                finalize.assert_not_called()
 
     def test_incomplete_asset_final_snapshot_is_held_without_retry(self):
         proposal = make_asset_proposal()
@@ -401,6 +409,10 @@ class LateVoteTests(TestCase):
                 proposal.refresh_from_db()
                 self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW)
                 self.assertEqual(proposal.asset_token.contract_sync_status, AssetToken.CONTRACT_SYNC_REQUIRES_REVIEW)
+                self.assertEqual(
+                    proposal.asset_token.contract_sync_error,
+                    f'Proposal {proposal.pk} vote snapshot failed ({type(error).__name__}); review required.',
+                )
 
     def test_interrupted_general_freeze_retries_and_finalizes_once(self):
         raw = self.raw_vote('old')
