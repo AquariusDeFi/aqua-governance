@@ -7,6 +7,7 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from celery.exceptions import SoftTimeLimitExceeded
 from dateutil.parser import parse as date_parse
 from requests.exceptions import RequestException
 from stellar_sdk import Server
@@ -98,10 +99,12 @@ def update_proposal_votes_snapshot(
             LogVote.objects.filter(id__in=stale_vote_ids).update(claimed=True)
 
         LogVote.objects.bulk_create(new_log_vote)
-        LogVote.objects.bulk_update(
-            update_log_vote,
-            ["group_index", "claimable_balance_id", "amount", "voted_amount", "transaction_link", "claimed"],
-        )
+        update_fields = ['group_index', 'claimable_balance_id', 'amount', 'transaction_link', 'claimed']
+        # Only the freeze writes voted_amount; a non-freezing run holds a value read before it started
+        # and must not overwrite a freeze committed in the meantime.
+        if freezing_amount:
+            update_fields.append('voted_amount')
+        LogVote.objects.bulk_update(update_log_vote, update_fields)
 
 
 def _build_request_builders(proposal: Proposal, horizon_server: Server):
@@ -404,6 +407,8 @@ def _resolve_origin_balance_id(
         return origin_cache[balance_id]
     try:
         origin_balance_id = find_origin_claimable_balance_id(horizon_server, balance_id)
+    except SoftTimeLimitExceeded:
+        raise
     except Exception:
         origin_balance_id = None
     origin_cache[balance_id] = origin_balance_id
@@ -559,6 +564,8 @@ def _make_new_vote(
     except NotFoundError:
         if metadata_balance_id == balance_id:
             created_at = claimable_balance['last_modified_time']
+    except SoftTimeLimitExceeded:
+        raise
     except Exception:
         logger.warning(
             "Error loading create_claimable_balance metadata for balance %s (metadata source %s)",
@@ -577,6 +584,8 @@ def _make_new_vote(
                     original_amount = original_amount or str(record["amount"])
         except NotFoundError:
             created_at = created_at or claimable_balance['last_modified_time']
+        except SoftTimeLimitExceeded:
+            raise
         except Exception:
             logger.warning(
                 "Error loading fallback create_claimable_balance metadata for balance %s",
