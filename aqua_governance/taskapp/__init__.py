@@ -44,6 +44,11 @@ def setup_periodic_tasks(sender, **kwargs):
                 "schedule": crontab(minute="*/1"),
                 "args": (),
             },
+            "aqua_governance.governance.tasks.task_sync_closed_proposal_claims": {
+                "task": "aqua_governance.governance.tasks.task_sync_closed_proposal_claims",
+                "schedule": crontab(minute="*/10"),
+                "args": (),
+            },
             "aqua_governance.governance.tasks.task_retry_failed_onchain_executions": {
                 "task": "aqua_governance.governance.tasks.task_retry_failed_onchain_executions",
                 "schedule": crontab(minute="*/10"),

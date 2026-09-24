@@ -28,7 +28,7 @@ class VoteUpdateSchedulingTests(SimpleTestCase):
             ):
                 self.assertIs(task_update_votes(*args, **kwargs), True)
 
-    def test_schedule_retains_active_and_closing_tasks_without_bulk_reindex(self):
+    def test_schedule_syncs_closed_proposal_claims_without_bulk_reindex(self):
         configured_app = SimpleNamespace(conf=SimpleNamespace(beat_schedule={}))
         with patch('aqua_governance.taskapp.app', configured_app):
             setup_periodic_tasks(sender=configured_app)
@@ -40,6 +40,9 @@ class VoteUpdateSchedulingTests(SimpleTestCase):
         )
         self.assertEqual(
             scheduled[f'{TASKS}.task_sync_proposal_statuses_by_time']['schedule'], crontab(minute='*/1'),
+        )
+        self.assertEqual(
+            scheduled[f'{TASKS}.task_sync_closed_proposal_claims']['schedule'], crontab(minute='*/10'),
         )
 
 
