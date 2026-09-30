@@ -14,6 +14,7 @@ from aqua_governance.governance.tests._factories import (
     QUATERNARY_ACCOUNT,
     TERTIARY_ACCOUNT,
 )
+from aqua_governance.governance.tests._migrations import RestoresMigrationLeaf
 
 
 UTC = datetime_timezone.utc
@@ -21,7 +22,7 @@ FIXED_NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
 MIGRATION_NOW_PATCH = 'aqua_governance.governance.migrations.0029_proposal_queue_slot.timezone.now'
 
 
-class ProposalQueueSlotBackfillMigrationTests(TransactionTestCase):
+class ProposalQueueSlotBackfillMigrationTests(RestoresMigrationLeaf, TransactionTestCase):
     migrate_from = [('governance', '0028_asset_token_and_proposal_fk')]
     migrate_to = [('governance', '0029_proposal_queue_slot')]
 

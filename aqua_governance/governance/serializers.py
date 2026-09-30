@@ -1,23 +1,13 @@
-import base64
-import hashlib
 import json
-
-from django.conf import settings
 
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 from django_quill.quill import Quill
-from stellar_sdk import HashMemo, Server, TransactionEnvelope
+from stellar_sdk import TransactionEnvelope
 
 from aqua_governance.governance.models import LogVote, Proposal, HistoryProposal
 from aqua_governance.governance.serializer_fields import QuillField
-from aqua_governance.utils.payments import (
-    check_payment,
-    check_xdr_payment,
-    check_proposal_status,
-    is_dev_payment_bypass_enabled,
-)
 
 
 class LogVoteSerializer(serializers.ModelSerializer):
@@ -78,54 +68,3 @@ class ProposalDetailSerializer(serializers.ModelSerializer):
 
     def get_payment_verification_status(self, obj):
         return obj.payment_verification_status
-
-
-class ProposalCreateSerializer(serializers.ModelSerializer):
-    text = QuillField()
-    discord_username = serializers.CharField(required=False, allow_null=True)
-
-    class Meta:
-        model = Proposal
-        fields = [
-            'proposed_by', 'title', 'text', 'start_at', 'end_at', 'transaction_hash',
-            'discord_channel_name', 'discord_username', 'status',
-        ]
-        read_only_fields = ['status', ]
-        extra_kwargs = {
-            'transaction_hash': {'required': True},
-            # 'discord_channel_name': {'required': True},
-        }
-
-    def validate(self, data):
-        data = super(ProposalCreateSerializer, self).validate(data)
-        if is_dev_payment_bypass_enabled():
-            data['hide'] = False
-            data['status'] = Proposal.FINE
-            return data
-
-        data['hide'] = True
-
-        tx_hash = data.get('transaction_hash', None)
-        horizon_server = Server(settings.HORIZON_URL)
-        try:
-            transaction_info = horizon_server.transactions().transaction(tx_hash).call()
-        except Exception:
-            data['status'] = Proposal.HORIZON_ERROR
-            return data
-
-        if not transaction_info.get('successful', None):
-            data['status'] = Proposal.FAILED_TRANSACTION
-
-        if not check_payment(tx_hash):
-            data['status'] = Proposal.INVALID_PAYMENT
-
-        memo = transaction_info.get('memo', None)
-        if not memo:
-            data['status'] = Proposal.BAD_MEMO
-
-        text_hash = hashlib.sha256(data['text'].html.encode('utf-8')).hexdigest()
-
-        if not base64.b64encode(HashMemo(text_hash).memo_hash).decode() == memo:
-            data['status'] = Proposal.BAD_MEMO
-
-        return data

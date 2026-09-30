@@ -16,9 +16,10 @@ from aqua_governance.governance.tests._factories import (
     TERTIARY_ACCOUNT,
     QUATERNARY_ACCOUNT,
 )
+from aqua_governance.governance.tests._migrations import RestoresMigrationLeaf
 
 
-class AssetSingleShotMigrationTests(TransactionTestCase):
+class AssetSingleShotMigrationTests(RestoresMigrationLeaf, TransactionTestCase):
     migrate_from = [('governance', '0027_proposal_manage_asset_proposals_permission')]
     migrate_to = [('governance', '0028_asset_token_and_proposal_fk')]
 

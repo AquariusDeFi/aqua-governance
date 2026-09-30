@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import transaction
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
+from rest_framework.validators import UniqueValidator
 
 from aqua_governance.governance.asset_payload import validate_asset_payload
 from aqua_governance.governance.asset_tokens import (
@@ -11,12 +12,19 @@ from aqua_governance.governance.asset_tokens import (
 )
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
 from aqua_governance.governance.exceptions import AssetProposalConflictError, ASSET_PROPOSAL_CONFLICT_DETAIL
-from aqua_governance.governance.models import AssetToken, Proposal, HistoryProposal, ProposalQueueSlot
+from aqua_governance.governance.models import (
+    AssetToken,
+    ConsumedTransaction,
+    Proposal,
+    HistoryProposal,
+    ProposalQueueSlot,
+)
 from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
 from aqua_governance.governance.proposal_queue_slots import is_queue_slot_available
-from aqua_governance.governance.serializer_fields import QuillField
+from aqua_governance.governance.serializer_fields import QuillField, TransactionHashField
 from aqua_governance.governance.serializers import HistoryProposalSerializer, LogVoteSerializer
-from aqua_governance.utils.payments import check_transaction_xdr
+from aqua_governance.utils.memo import PURPOSE_CREATE, PURPOSE_SUBMIT, PURPOSE_UPDATE, build_memo_expectation
+from aqua_governance.utils.payments import inspect_envelope
 
 # ---------------------------------------------------------------------------
 # Asset field constants (shared by validation helpers)
@@ -67,6 +75,41 @@ def validate_no_matching_pending_create(attrs):
                 "non_field_errors": "Please wait a few minutes while the pending proposal payment is checked.",
             }
         )
+
+
+def _hash_unique_validator():
+    """The ``UniqueValidator`` DRF attaches to an undeclared model field, rebuilt by hand.
+
+    Declaring a field short-circuits ``ModelSerializer.get_fields``, so the validator DRF
+    would have derived from ``unique=True`` never arrives; without this, today's clean 400
+    on a duplicate hash becomes an ``IntegrityError``.  ``iexact`` because the two hash
+    columns are bare ``CharField``s written verbatim from client input since 2021 and
+    PostgreSQL compares ``varchar`` case-sensitively.
+    """
+    return UniqueValidator(queryset=Proposal.objects.all(), lookup='iexact')
+
+
+def _reject_hash_already_seen(value, *, other_column):
+    """Reject a hash already staged elsewhere or already spent on a past transition.
+
+    A read, so it cannot squat: both frontends stage before signing, so the owner's row -
+    and its claim on the hash - always exists before the payment is broadcast, and a squat
+    therefore costs the victim a pre-payment 400 rather than funds.  Proposal payment
+    hashes are fully precomputable; nothing here relies on them being secret.
+
+    The lookup spans every row including this one: a proposal's own confirmed
+    ``transaction_hash`` is a spent payment, and re-presenting it as the payment for a new
+    transition is a replay whichever proposal it came from.  Re-staging the *same* pending
+    hash stays legal - that comparison is the ``UniqueValidator``'s, and it excludes the
+    instance being updated.
+    """
+    if Proposal.objects.filter(**{'{0}__iexact'.format(other_column): value}).exists():
+        raise ValidationError('This transaction is already staged on another proposal.')
+
+    if ConsumedTransaction.objects.filter(transaction_hash__iexact=value).exists():
+        raise ValidationError('This transaction has already been used for a proposal transition.')
+
+    return value
 
 
 def validate_asset_payload_fields(attrs):
@@ -273,6 +316,8 @@ class ProposalDetailSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 class ProposalCreateSerializer(serializers.ModelSerializer):
     text = QuillField()
+    title = serializers.CharField(max_length=256, trim_whitespace=False)
+    transaction_hash = TransactionHashField(required=True, validators=[_hash_unique_validator()])
     discord_username = serializers.CharField(required=True, allow_null=True)
     payment_verification_status = serializers.SerializerMethodField()
 
@@ -326,11 +371,13 @@ class ProposalCreateSerializer(serializers.ModelSerializer):
         ]
         extra_kwargs = {
             "envelope_xdr": {"required": True},
-            "transaction_hash": {"required": True},
         }
 
     def get_payment_verification_status(self, obj):
         return obj.payment_verification_status
+
+    def validate_transaction_hash(self, value):
+        return _reject_hash_already_seen(value, other_column="new_transaction_hash")
 
     def validate(self, attrs):
         proposal_type = attrs.get("proposal_type", Proposal.PROPOSAL_TYPE_GENERAL)
@@ -360,10 +407,20 @@ class ProposalCreateSerializer(serializers.ModelSerializer):
         validated_data["proposal_type"] = Proposal.PROPOSAL_TYPE_GENERAL
         validated_data["onchain_execution_status"] = Proposal.ONCHAIN_EXECUTION_NOT_REQUIRED
 
-        status = check_transaction_xdr(validated_data, settings.PROPOSAL_CREATE_OR_UPDATE_COST)
-        if status not in (Proposal.FINE, Proposal.HORIZON_ERROR):
-
-            validated_data["hide"] = True
+        # Advisory only: the envelope is unsigned and client-supplied. Authorization happens
+        # in proposal_transactions.check_transaction against Horizon.
+        status = inspect_envelope(
+            envelope_xdr=validated_data["envelope_xdr"],
+            expected_payer=validated_data["proposed_by"],
+            memo_expectation=build_memo_expectation(
+                PURPOSE_CREATE,
+                proposed_by=validated_data["proposed_by"],
+                proposal_type=Proposal.PROPOSAL_TYPE_GENERAL,
+                title=validated_data["title"],
+                text_html=validated_data["text"].html,
+            ),
+            payment_amount=settings.PROPOSAL_CREATE_OR_UPDATE_COST,
+        )
         validated_data["payment_status"] = status
 
         return super().create(validated_data)
@@ -375,10 +432,15 @@ class ProposalCreateSerializer(serializers.ModelSerializer):
 class AssetProposalCreateSerializer(serializers.ModelSerializer):
     payment_verification_status = serializers.SerializerMethodField()
     text = QuillField()
+    title = serializers.CharField(max_length=256, trim_whitespace=False)
+    transaction_hash = TransactionHashField(required=True, validators=[_hash_unique_validator()])
     discord_username = serializers.CharField(required=True, allow_null=True)
 
     def get_payment_verification_status(self, obj):
         return obj.payment_verification_status
+
+    def validate_transaction_hash(self, value):
+        return _reject_hash_already_seen(value, other_column="new_transaction_hash")
 
     class Meta:
         model = Proposal
@@ -444,7 +506,6 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
         ]
         extra_kwargs = {
             "envelope_xdr": {"required": True},
-            "transaction_hash": {"required": True},
             "proposal_type": {"required": True},
         }
 
@@ -473,9 +534,20 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
         validated_data["action"] = Proposal.TO_CREATE
         validated_data["onchain_execution_status"] = Proposal.ONCHAIN_EXECUTION_PENDING
 
-        status = check_transaction_xdr(validated_data, settings.PROPOSAL_CREATE_OR_UPDATE_COST)
-        if status not in (Proposal.FINE, Proposal.HORIZON_ERROR):
-            validated_data["hide"] = True
+        # Advisory only: the envelope is unsigned and client-supplied. Authorization happens
+        # in proposal_transactions.check_transaction against Horizon.
+        status = inspect_envelope(
+            envelope_xdr=validated_data["envelope_xdr"],
+            expected_payer=validated_data["proposed_by"],
+            memo_expectation=build_memo_expectation(
+                PURPOSE_CREATE,
+                proposed_by=validated_data["proposed_by"],
+                proposal_type=validated_data["proposal_type"],
+                title=validated_data["title"],
+                text_html=validated_data["text"].html,
+            ),
+            payment_amount=settings.PROPOSAL_CREATE_OR_UPDATE_COST,
+        )
         validated_data["payment_status"] = status
 
         with transaction.atomic():
@@ -489,9 +561,10 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
 # Update / Submit serializers
 # ---------------------------------------------------------------------------
 class ProposalUpdateSerializer(serializers.ModelSerializer):  # think about joining with create serializer
-    text = QuillField(required=False)
+    text = QuillField(read_only=True)
     new_text = QuillField()
-    discord_username = serializers.CharField(required=False, allow_null=True)
+    new_title = serializers.CharField(max_length=256, trim_whitespace=False)
+    new_transaction_hash = TransactionHashField(required=True, validators=[_hash_unique_validator()])
     payment_verification_status = serializers.SerializerMethodField()
 
     class Meta:
@@ -504,11 +577,9 @@ class ProposalUpdateSerializer(serializers.ModelSerializer):  # think about join
             "text",
             "start_at",
             "end_at",
-            "transaction_hash",
             "discord_channel_url",
             "discord_channel_name",
             "discord_username",
-            "envelope_xdr",
             "proposal_status",
             "payment_status",
             "payment_verification_status",
@@ -553,30 +624,44 @@ class ProposalUpdateSerializer(serializers.ModelSerializer):  # think about join
             "onchain_execution_poll_count",
         ]
         extra_kwargs = {
-            "new_title": {"required": True},
             "new_text": {"required": True},
             "new_envelope_xdr": {"required": True},
-            "new_transaction_hash": {"required": True},
         }
 
     def get_payment_verification_status(self, obj):
         return obj.payment_verification_status
 
+    def validate_new_transaction_hash(self, value):
+        return _reject_hash_already_seen(value, other_column="transaction_hash")
+
     def update(self, instance, validated_data):
         validated_data["action"] = Proposal.TO_UPDATE
-        data_to_check = {
-            "text": validated_data["new_text"],
-            "envelope_xdr": validated_data["new_envelope_xdr"],
-        }
 
-        status = check_transaction_xdr(data_to_check, settings.PROPOSAL_CREATE_OR_UPDATE_COST)
+        # Advisory only: the envelope is unsigned and client-supplied. Authorization happens
+        # in proposal_transactions.check_transaction against Horizon.
+        status = inspect_envelope(
+            envelope_xdr=validated_data["new_envelope_xdr"],
+            expected_payer=instance.proposed_by,
+            memo_expectation=build_memo_expectation(
+                PURPOSE_UPDATE,
+                proposal_id=instance.id,
+                title=validated_data["new_title"],
+                text_html=validated_data["new_text"].html,
+            ),
+            payment_amount=settings.PROPOSAL_CREATE_OR_UPDATE_COST,
+        )
         validated_data["payment_status"] = status
+        # Any staging write re-arms the beat sweep: the marker records the hash whose
+        # verdict was terminal, and re-staging the same hash with corrected content is the
+        # normal recovery from a memo or payer mismatch.
+        validated_data["payment_check_rejected_hash"] = None
         return super().update(instance, validated_data)
 
 
 class SubmitSerializer(serializers.ModelSerializer):
     payment_verification_status = serializers.SerializerMethodField()
-    text = QuillField(required=False)
+    text = QuillField(read_only=True)
+    new_transaction_hash = TransactionHashField(required=True, validators=[_hash_unique_validator()])
 
     start_at = serializers.DateTimeField(source='new_start_at')
     end_at = serializers.DateTimeField(source='new_end_at')
@@ -593,7 +678,6 @@ class SubmitSerializer(serializers.ModelSerializer):
             "discord_channel_url",
             "discord_channel_name",
             "discord_username",
-            "envelope_xdr",
             "proposal_status",
             "payment_status",
             "payment_verification_status",
@@ -664,11 +748,13 @@ class SubmitSerializer(serializers.ModelSerializer):
             "start_at": {"required": True},
             "end_at": {"required": True},
             "new_envelope_xdr": {"required": True},
-            "new_transaction_hash": {"required": True},
         }
 
     def get_payment_verification_status(self, obj):
         return obj.payment_verification_status
+
+    def validate_new_transaction_hash(self, value):
+        return _reject_hash_already_seen(value, other_column="transaction_hash")
 
     def validate(self, attrs):
         new_start_at = attrs["new_start_at"]
@@ -703,9 +789,26 @@ class SubmitSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         validated_data["action"] = Proposal.TO_SUBMIT
-        data_to_check = {"text": instance.text, "envelope_xdr": validated_data["new_envelope_xdr"]}
-        status = check_transaction_xdr(data_to_check, settings.PROPOSAL_SUBMIT_COST)
+
+        # Advisory only: the envelope is unsigned and client-supplied. Authorization happens
+        # in proposal_transactions.check_transaction against Horizon.
+        status = inspect_envelope(
+            envelope_xdr=validated_data["new_envelope_xdr"],
+            expected_payer=instance.proposed_by,
+            memo_expectation=build_memo_expectation(
+                PURPOSE_SUBMIT,
+                proposal_id=instance.id,
+                start_at=validated_data["new_start_at"],
+                end_at=validated_data["new_end_at"],
+                legacy_text_html=instance.text.html,
+            ),
+            payment_amount=settings.PROPOSAL_SUBMIT_COST,
+        )
         validated_data["payment_status"] = status
+        # Any staging write re-arms the beat sweep: the marker records the hash whose
+        # verdict was terminal, and re-staging the same hash with corrected content is the
+        # normal recovery from a memo or payer mismatch.
+        validated_data["payment_check_rejected_hash"] = None
 
         with transaction.atomic():
             acquire_proposal_transition_lock()

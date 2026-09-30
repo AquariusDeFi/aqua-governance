@@ -19,6 +19,7 @@ from aqua_governance.governance.tests._factories import (
     make_asset_proposal_raw,
     patch_ice_circulating_supply,
 )
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verifies
 
 
 class AssetProposalConflictTests(TestCase):
@@ -81,7 +82,7 @@ class AssetProposalConflictTests(TestCase):
         end_at = start_at + timedelta(days=7, seconds=-1)
         return start_at, end_at
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_queued_or_voting_asset_proposals_block_same_canonical_asset_across_types_and_identifiers(self, _mock_check_xdr):
         scenarios = [
             {
@@ -155,7 +156,7 @@ class AssetProposalConflictTests(TestCase):
                     self.assertIn('proposal_id', response.data)
                     self.assertEqual(int(response.data['proposal_id'][0]), blocker.id)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_discussion_same_asset_proposal_does_not_block_create(self, _mock_check_xdr):
         self._create_asset_proposal(transaction_hash='d' * 64, proposal_status=Proposal.DISCUSSION)
 
@@ -167,7 +168,7 @@ class AssetProposalConflictTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_hidden_expired_and_voted_asset_proposals_do_not_block_create(self, _mock_check_xdr):
         scenarios = [
             {'label': 'hidden', 'overrides': {'hide': True}},
@@ -189,7 +190,7 @@ class AssetProposalConflictTests(TestCase):
 
                 self.assertEqual(response.status_code, 201)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_pending_draft_create_does_not_block_create(self, _mock_check_xdr):
         self._create_asset_proposal(
             draft=True,
@@ -205,7 +206,7 @@ class AssetProposalConflictTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_to_submit_and_to_update_asset_proposals_do_not_block_create_while_still_in_discussion(self, _mock_check_xdr):
         for index, action in enumerate((Proposal.TO_SUBMIT, Proposal.TO_UPDATE), start=1):
             with self.subTest(action=action):
@@ -225,8 +226,8 @@ class AssetProposalConflictTests(TestCase):
 
                 self.assertEqual(response.status_code, 201)
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_confirmed_create_payment_keeps_asset_proposal_pending_while_conflict_exists(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_confirmed_create_payment_keeps_asset_proposal_pending_while_conflict_exists(self, _mock_verify_payment):
         blocker = self._create_asset_proposal(
             transaction_hash='6' * 64,
             proposal_status=Proposal.QUEUED,
@@ -251,7 +252,7 @@ class AssetProposalConflictTests(TestCase):
         self.assertEqual(proposal.payment_status, Proposal.FINE)
         self.assertFalse(proposal.hide)
 
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_discussion_same_asset_proposal_does_not_block_submit(self, _mock_check_xdr):
         self._create_asset_proposal(transaction_hash='8' * 64, proposal_status=Proposal.DISCUSSION)
         proposal = self._create_asset_proposal(transaction_hash='9' * 64)
@@ -314,8 +315,11 @@ class AssetProposalConflictTests(TestCase):
         self.assertIsNone(proposal.new_end_at)
         self.assertFalse(ProposalQueueSlot.objects.filter(proposal=proposal).exists())
 
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    def test_check_payment_returns_409_for_active_same_asset_conflict_and_does_not_book_slot(self, _mock_check_status):
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    def test_check_payment_returns_409_for_active_same_asset_conflict_and_does_not_book_slot(
+        self,
+        _mock_verify_payment,
+    ):
         blocker = self._create_asset_proposal(
             transaction_hash='d' * 64,
             proposal_status=Proposal.VOTING,
