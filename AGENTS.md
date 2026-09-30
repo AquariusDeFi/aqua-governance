@@ -98,7 +98,6 @@ Settings default to `config.settings.dev`; the suite runs against it.
 │  task_sync_proposal_statuses_by_time (every 1 min)           │
 │  task_check_pending_proposal_payments (every 1 min)          │
 │  task_check_expired_proposals (every 24h)                    │
-│  task_update_votes (every 10 min, for VOTED proposals)       │
 │  task_poll_submitted_onchain_executions (every 1 min)        │
 │  task_retry_failed_onchain_executions (every 10 min)         │
 └───────────────────────┬────────────────────────────────────┘
@@ -368,9 +367,13 @@ Defined in `aqua_governance/taskapp/__init__.py`.
 | `task_sync_proposal_statuses_by_time` | Every 1 min | VOTING → VOTED at `end_at`; expires stale DISCUSSION rows; starts due QUEUED proposals |
 | `task_check_pending_proposal_payments` | Every 1 min | The payment sweep: `check_transaction()` for every non-hidden row with a pending action |
 | `task_check_expired_proposals` | Every 24h | Marks DISCUSSION → EXPIRED after 30 days inactive |
-| `task_update_votes` | Every 10 min | Re-indexes votes for all VOTED proposals |
 | `task_poll_submitted_onchain_executions` | Every 1 min | Polls Soroban for submitted asset-registry executions |
 | `task_retry_failed_onchain_executions` | Every 10 min | Re-attempts FAILED/PENDING on-chain executions |
+
+`task_update_votes` requires an explicit proposal ID for indexing. Completed
+proposals are not periodically re-indexed; legacy queued calls without an ID
+return without reading or changing data. Active voting updates and the final
+freeze at closing still call the task with the proposal ID.
 
 There are **no** signal receivers and no ETA-scheduled tasks: state advances by polling in
 `task_sync_proposal_statuses_by_time`.

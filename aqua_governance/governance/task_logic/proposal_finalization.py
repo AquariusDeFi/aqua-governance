@@ -8,6 +8,7 @@ from django.db import transaction
 
 from aqua_governance.governance.asset_tokens import apply_asset_proposal_result_to_token
 from aqua_governance.governance.models import LogVote, Proposal
+from aqua_governance.governance.vote_eligibility import eligible_votes
 
 
 logger = logging.getLogger()
@@ -29,9 +30,10 @@ def _sum_votes_for_proposal(proposal: Proposal, vote_choice: str) -> Decimal:
     that already have a snapshot preserve the existing ``voted_amount``.
     """
     supported_vote_assets = [settings.GOVERNANCE_ICE_ASSET_CODE, settings.GDICE_ASSET_CODE]
+    votes = eligible_votes(proposal.logvote_set.all())
 
     if proposal.proposal_status == Proposal.VOTED:
-        rows = proposal.logvote_set.filter(
+        rows = votes.filter(
             vote_choice=vote_choice,
             hide=False,
             asset_code__in=supported_vote_assets,
@@ -42,7 +44,7 @@ def _sum_votes_for_proposal(proposal: Proposal, vote_choice: str) -> Decimal:
         )
         return _as_decimal(total)
 
-    amounts = proposal.logvote_set.filter(
+    amounts = votes.filter(
         vote_choice=vote_choice,
         hide=False,
         claimed=False,
