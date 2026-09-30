@@ -7,7 +7,7 @@ from stellar_sdk.exceptions import PrepareTransactionException
 from stellar_sdk.soroban_rpc import SendTransactionStatus
 
 from aqua_governance.governance.models import Proposal
-from aqua_governance.governance.onchain_hooks.validators import normalize_asset_addresses
+from aqua_governance.governance.asset_payload import normalize_asset_addresses
 
 
 logger = logging.getLogger(__name__)

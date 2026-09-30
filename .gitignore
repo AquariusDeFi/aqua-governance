@@ -2,6 +2,7 @@
 # IntelliJ project files
 .idea
 .vscode
+.zed
 *.iml
 out
 gen
@@ -18,6 +19,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+.venv/
 config/settings/env/
 build/
 develop-eggs/
