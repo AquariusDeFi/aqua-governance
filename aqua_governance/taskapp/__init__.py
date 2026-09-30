@@ -39,11 +39,6 @@ def setup_periodic_tasks(sender, **kwargs):
                 "schedule": crontab(minute="*/1"),
                 "args": (),
             },
-            "aqua_governance.governance.tasks.task_update_votes": {
-                "task": "aqua_governance.governance.tasks.task_update_votes",
-                "schedule": crontab(minute="*/10"),
-                "args": (),
-            },
             "aqua_governance.governance.tasks.task_poll_submitted_onchain_executions": {
                 "task": "aqua_governance.governance.tasks.task_poll_submitted_onchain_executions",
                 "schedule": crontab(minute="*/1"),

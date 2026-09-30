@@ -2,7 +2,17 @@ from django.urls import include, path
 
 from rest_framework import routers
 
-from aqua_governance.governance.views import AssetProposalViewSet, AssetTokenView, LogVoteView, ProposalsView, ProposalQueueViewSet, ProposalViewSet, TestProposalViewSet
+from aqua_governance.governance.health import health
+from aqua_governance.governance.views import (
+    AssetProposalViewSet,
+    AssetTokenView,
+    LogVoteView,
+    ProposalQueueViewSet,
+    ProposalsView,
+    ProposalViewSet,
+    TestProposalViewSet,
+)
+
 
 api_router = routers.SimpleRouter()
 api_router.register(r'proposals', ProposalsView, basename='proposals')  # TODO: remove it
@@ -15,5 +25,6 @@ api_router.register(r'proposal-queue', ProposalQueueViewSet, basename='proposal_
 
 
 urlpatterns = [
+    path('health/', health, name='health'),
     path('', include(api_router.urls)),
 ]

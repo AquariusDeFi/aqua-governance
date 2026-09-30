@@ -13,16 +13,19 @@ ICE_ASSET = Asset(settings.GOVERNANCE_ICE_ASSET_CODE, settings.GOVERNANCE_ICE_AS
 GDICE_ASSET = Asset(settings.GDICE_ASSET_CODE, settings.GDICE_ASSET_ISSUER)
 
 
+def is_supported_vote_asset(asset_string: str) -> bool:
+    return parse_asset_string(asset_string) in [AQUA_ASSET, ICE_ASSET, GDICE_ASSET]
+
+
 def parse_vote(vote_key: str, vote_group_index: int, claimable_balance: dict, proposal: Proposal, vote_choice: str,
                created_at: str, original_amount: str, vote_id: Optional[int], freezing_amount: bool = False,
                original_voted_amount: Optional[Decimal] = None) -> Optional[LogVote]:
     balance_id = claimable_balance['id']
-    asset = parse_asset_string(claimable_balance['asset'])
     asset_code = claimable_balance['asset'].split(':')[0]
     amount = claimable_balance['amount']
     transaction_link = claimable_balance['_links']['transactions']['href'].replace('{?cursor,limit,order}', '')
 
-    if asset not in [AQUA_ASSET, ICE_ASSET, GDICE_ASSET]:
+    if not is_supported_vote_asset(claimable_balance['asset']):
         return None
 
     time_list, account_issuer = _make_time_list_and_account_issuer_for_vote(claimable_balance, proposal)

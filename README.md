@@ -45,6 +45,26 @@ pipenv run python manage.py runserver 0.0.0.0:8000
 
 Admin and API are then served on port 8000 (`/open/cms/` for the admin).
 
+## Operational health monitoring
+
+Public `GET /api/health/` (also `HEAD`) reports records that require manual
+review. Configure an external monitor to require HTTP **200** and alert on
+non-200 responses:
+
+- **200**: `{"status": "ok", "requires_review": {"proposals": 0, "asset_tokens": 0}}`.
+- **503**: `{"status": "requires_review", "requires_review": {"proposals": 1, "asset_tokens": 0}}`
+  when any proposal execution or asset-token synchronization has
+  `REQUIRES_REVIEW` status. The separate counts include hidden and draft
+  proposals and tokens without proposals; no record details are exposed.
+- **503**: `{"status": "unavailable"}` if the database cannot be queried.
+
+Responses use `Cache-Control: no-store`. The endpoint only reads the database;
+it does not contact Horizon or Soroban RPC, enqueue work, or repair records.
+Other execution and synchronization states do not trigger this review signal.
+Use it as an operational alert, **not a liveness/readiness probe**: review work
+does not mean the process should be restarted or removed from traffic. Polling
+does not itself send notifications; the external monitor must handle alerts.
+
 ## Commands
 
 | Command | What it does |

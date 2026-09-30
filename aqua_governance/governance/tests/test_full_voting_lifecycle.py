@@ -15,6 +15,7 @@ from aqua_governance.governance.tests._factories import (
     TERTIARY_ACCOUNT,
     patch_ice_circulating_supply,
 )
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, verifies
 
 
 FIXED_NOW = datetime(2024, 1, 10, 12, 0, tzinfo=datetime_timezone.utc)
@@ -42,6 +43,10 @@ class FakeHorizonRequestBuilder:
 
     def for_claimable_balance(self, balance_id):
         self._key = balance_id
+        return self
+
+    def for_transaction(self, transaction_hash):
+        self._key = transaction_hash
         return self
 
     def order(self, desc=False):
@@ -139,13 +144,13 @@ class FullVotingLifecycleTests(TestCase):
             'created_at': _iso_z(created_at),
         }
 
-    @patch('aqua_governance.governance.views.ProposalViewSet._check_owner_permissions')
-    @patch('aqua_governance.governance.proposal_transactions.check_proposal_status', return_value=Proposal.FINE)
-    @patch('aqua_governance.governance.serializers_v2.check_transaction_xdr', return_value=Proposal.FINE)
+    @patch('aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch')
+    @patch(VERIFY_PAYMENT, side_effect=verifies())
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_general_proposal_full_queue_vote_and_finalize_with_fake_horizon_votes_and_mocked_payment_checks(
         self,
         _mock_check_xdr,
-        _mock_check_status,
+        _mock_verify_payment,
         _mock_owner_permissions,
     ):
         """Payment/XDR/ownership checks are mocked here; dedicated tests cover real validation paths."""
@@ -323,6 +328,28 @@ class FullVotingLifecycleTests(TestCase):
                 ],
             },
         )
+
+        # Service-sponsored balances need a provable original self-sponsored
+        # create operation. Supply the replacement transaction and its origin.
+        for balance_id, voter in (
+            (for_balance_id, SECONDARY_ACCOUNT),
+            (for_balance_id_secondary, SECONDARY_ACCOUNT),
+            (against_balance_id, TERTIARY_ACCOUNT),
+        ):
+            operations = fake_server._operations_by_balance_id
+            origin_id = f'origin-{balance_id}'
+            original = operations[balance_id][0]
+            operations[origin_id] = [{
+                **original, 'sponsor': voter, 'claimants': [{'destination': voter}],
+            }]
+            replacement = {
+                **original, 'id': f'create-{balance_id}', 'transaction_hash': f'tx-{balance_id}',
+                'sponsor': service_sponsor, 'claimants': [{'destination': voter}],
+            }
+            operations[balance_id] = [replacement]
+            operations[replacement['transaction_hash']] = [
+                {'type': 'clawback_claimable_balance', 'balance_id': origin_id}, replacement,
+            ]
 
         with patch('aqua_governance.governance.tasks.Server', return_value=fake_server):
             task_update_proposal_results(proposal.id, freezing_amount=False)

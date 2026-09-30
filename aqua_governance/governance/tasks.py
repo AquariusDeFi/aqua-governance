@@ -4,24 +4,26 @@ from typing import Optional
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
+
 from stellar_sdk import Server
 from stellar_sdk.soroban_rpc import GetTransactionStatus
 
 from aqua_governance.governance import proposal_transactions
-from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
+from aqua_governance.governance.db_locks import (
+    _release_payment_sweep_lock,
+    _try_acquire_payment_sweep_lock,
+    acquire_proposal_transition_lock,
+)
 from aqua_governance.governance.models import AssetToken, Proposal, ProposalQueueSlot
 from aqua_governance.governance.onchain_hooks import execute_onchain_action
 from aqua_governance.governance.onchain_hooks.soroban import get_soroban_transaction
 from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
-from aqua_governance.governance.task_logic.proposal_finalization import (
-    update_proposal_final_results,
-)
-from aqua_governance.governance.task_logic.vote_indexing import (
-    update_proposal_votes_snapshot,
-)
+from aqua_governance.governance.task_logic.proposal_finalization import update_proposal_final_results
+from aqua_governance.governance.task_logic.vote_indexing import IncompleteVoteSnapshot, update_proposal_votes_snapshot
 from aqua_governance.taskapp import app as celery_app
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,17 +151,87 @@ def task_check_expired_proposals():
 
 @celery_app.task(ignore_result=True)
 def task_check_pending_proposal_payments():
-    proposals = Proposal.objects.filter(
-        hide=False,
-    ).exclude(action=Proposal.NONE)
-    for proposal in proposals:
-        proposal_transactions.check_transaction(proposal)
+    if not _try_acquire_payment_sweep_lock():
+        logger.info('Payment sweep already running; skipping this tick.')
+        return
+
+    try:
+        # A row whose pending hash is the one already terminally rejected can never
+        # resolve differently, so it is filtered out in SQL rather than re-asked of
+        # Horizon every minute.  The F comparison is NULL for a row that was never
+        # rejected, and Django's NOT (...) keeps such a row in the sweep.
+        proposals = (
+            Proposal.objects.filter(hide=False)
+            .exclude(action=Proposal.NONE)
+            .exclude(
+                action=Proposal.TO_CREATE,
+                transaction_hash=F('payment_check_rejected_hash'),
+            )
+            .exclude(
+                ~Q(action=Proposal.TO_CREATE),
+                new_transaction_hash=F('payment_check_rejected_hash'),
+            )
+            .order_by('id')
+        )
+        for proposal in proposals:
+            try:
+                proposal_transactions.check_transaction(proposal)
+            except Exception:
+                # One unconfirmable row must not stop the rows queued behind it: a
+                # rejected claim, a deadlock and every programming error now reach
+                # here, where the old blanket catch in payments.py used to hide them.
+                logger.exception(
+                    'Pending payment check failed.',
+                    extra={'proposal_id': proposal.id},
+                )
+    finally:
+        if not _release_payment_sweep_lock():
+            # A session-level lock the release did not own stays held for the life of that
+            # database session, and every later tick then logs the benign-looking overlap
+            # line instead.  Say so once, loudly, so the two states are distinguishable.
+            logger.warning('Payment sweep advisory lock was not released; later ticks may be skipped.')
 
 
-@celery_app.task(ignore_result=True)
-def task_update_proposal_results(proposal_id: int, freezing_amount: bool = False):
-    task_update_votes(proposal_id, freezing_amount)
+@celery_app.task(bind=True, ignore_result=True)
+def task_update_proposal_results(self, proposal_id: int, freezing_amount: bool = False):
+    if task_update_votes(proposal_id, freezing_amount) is False:
+        if freezing_amount and Proposal.objects.filter(
+            pk=proposal_id,
+            proposal_type=Proposal.PROPOSAL_TYPE_GENERAL,
+            proposal_status=Proposal.VOTED,
+        ).exists():
+            raise self.retry(exc=IncompleteVoteSnapshot(
+                f'Proposal {proposal_id} final vote snapshot failed.',
+            ))
+        return
     update_proposal_final_results(proposal_id)
+
+
+def _hold_incomplete_vote_snapshot(proposal_id: int, cause: str) -> None:
+    with transaction.atomic():
+        proposal = Proposal.objects.select_for_update().filter(
+            pk=proposal_id, proposal_status=Proposal.VOTED,
+            proposal_type__in=Proposal.ASSET_PROPOSAL_TYPES,
+            onchain_execution_status__in=[
+                Proposal.ONCHAIN_EXECUTION_PENDING, Proposal.ONCHAIN_EXECUTION_FAILED,
+                Proposal.ONCHAIN_EXECUTION_SKIPPED,
+            ],
+            onchain_execution_tx_hash__isnull=True,
+            onchain_execution_started_at__isnull=True,
+            onchain_execution_submitted_at__isnull=True,
+            onchain_execution_poll_count=0,
+        ).first()
+        if proposal is None:
+            return
+        Proposal.objects.filter(pk=proposal.pk).update(
+            onchain_execution_status=Proposal.ONCHAIN_EXECUTION_REQUIRES_REVIEW,
+        )
+        if proposal.asset_token_id:
+            AssetToken.objects.filter(pk=proposal.asset_token_id, contract_sync_tx_hash__isnull=True).update(
+                contract_sync_status=AssetToken.CONTRACT_SYNC_REQUIRES_REVIEW,
+                contract_sync_error=f'Proposal {proposal.pk} vote snapshot failed ({cause}); review required.',
+                contract_sync_updated_at=timezone.now(),
+            )
 
 
 @celery_app.task(ignore_result=True)
@@ -168,18 +240,33 @@ def task_update_votes(proposal_id: Optional[int] = None, freezing_amount: bool =
     Update votes for proposal.
     """
     if proposal_id is None:
-        proposals = Proposal.objects.filter(proposal_status__in=[Proposal.VOTED]).order_by('-id')
-    else:
-        proposals = Proposal.objects.filter(id=proposal_id)
+        # Accept historical bulk-update tasks already queued before their schedule was removed.
+        return True
 
+    proposals = Proposal.objects.filter(id=proposal_id)
     horizon_server = Server(settings.HORIZON_URL)
+    complete = True
 
     for proposal in proposals:
-        update_proposal_votes_snapshot(
-            proposal=proposal,
-            horizon_server=horizon_server,
-            freezing_amount=freezing_amount,
-        )
+        try:
+            update_proposal_votes_snapshot(
+                proposal=proposal,
+                horizon_server=horizon_server,
+                freezing_amount=freezing_amount,
+            )
+        except IncompleteVoteSnapshot:
+            complete = False
+            logger.exception('Skip finalization of proposal %s: incomplete original vote metadata.', proposal.pk)
+            _hold_incomplete_vote_snapshot(proposal.pk, 'incomplete original vote metadata')
+        except Exception as error:  # noqa: B902
+            if not freezing_amount:
+                raise
+            # A freeze that did not complete leaves voted_amount unset; finalizing would count current amounts.
+            complete = False
+            logger.exception('Skip finalization of proposal %s: final vote snapshot failed.', proposal.pk)
+            # Class name only: the field is shown in admin and must not carry exception details.
+            _hold_incomplete_vote_snapshot(proposal.pk, type(error).__name__)
+    return complete
 
 
 @celery_app.task(ignore_result=True)
