@@ -424,7 +424,6 @@ task_check_pending_proposal_payments  [every minute]
 |-----------|---------|---------|-------|
 | `api/proposals/` | ProposalsView | v1 legacy | List + retrieve **only** (POST returns 405); filtered to `created_at ≤ 2022-04-15` |
 | `api/proposal/` | ProposalViewSet | v2 current | Full CRUD + submit + check_payment; excludes `id=65` |
-| `api/test/proposal/` | TestProposalViewSet | test | Same as v2 without `id=65` exclusion; TODO: remove |
 | `api/votes-for-proposal/` | LogVoteView | both | Vote listing only |
 | `api/asset-proposal/` | AssetProposalViewSet | v2 | Asset-governance proposals (`ADD_ASSET` / `REMOVE_ASSET`) |
 | `api/asset-tokens/` | AssetTokenView | v2 | On-chain asset-token registry |
@@ -541,7 +540,7 @@ Both are PostgreSQL advisory locks and both must stay distinct.
 
 2. **QuillField serializer quirk**: `serializer_fields.QuillField.get_attribute()` hardcodes `instance.text.html` regardless of the field name. This works for `text` fields but must be overridden for `new_text`. `to_internal_value` wraps input HTML in a `Quill` object with empty delta.
 
-3. **Hardcoded `id=65` exclusion**: `ProposalViewSet` base queryset has `.exclude(id=65)`. `TestProposalViewSet` overrides the queryset without this exclusion. Historical artifact — do not remove without checking data.
+3. **Hardcoded `id=65` exclusion**: `ProposalViewSet` base queryset has `.exclude(id=65)`. Historical artifact — do not remove without checking data.
 
 4. **Legacy v1 date cutoff**: `ProposalsView` (v1) hardcodes `created_at__lte=datetime(2022, 4, 15)`. Any proposal created after this date is invisible via the v1 API.
 
