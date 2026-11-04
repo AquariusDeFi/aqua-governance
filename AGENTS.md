@@ -213,7 +213,9 @@ the staged `new_*` copy — is a claim to be checked.
 
 Verdicts are `FINE | HORIZON_ERROR | FAILED_TRANSACTION | INVALID_PAYMENT | BAD_MEMO`.
 Only `HORIZON_ERROR` is retryable; a terminal verdict records
-`payment_check_rejected_hash` so the sweep stops re-asking Horizon about it.
+`payment_check_rejected_hash` so the sweep stops re-asking Horizon about it. A
+`HORIZON_ERROR` that is a 404 starts `payment_not_found_since`, and the sweep stops
+asking about that hash once it has stayed unknown for `PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT`.
 
 **The advisory check: `inspect_envelope` (`utils/payments.py`)**, called by the create /
 update / submit serializers at staging time. It parses the posted `envelope_xdr`
@@ -280,6 +282,7 @@ Phase 4 — Bulk DB operations:
 | proposal_type | Choice | GENERAL / ADD_ASSET / REMOVE_ASSET (asset types grouped as `ASSET_PROPOSAL_TYPES`) |
 | payment_status | Choice | FINE / HORIZON_ERROR / BAD_MEMO / INVALID_PAYMENT / FAILED_TRANSACTION |
 | payment_check_rejected_hash | CharField(64, null) | The pending hash a terminal verdict was recorded for; `''` means "there was no hash". Takes the row out of the beat sweep and dedups the operator alert. Cleared by every promotion, and by `manage.py rearm_proposal_payment_check` |
+| payment_not_found_since | DateTimeField(null) | When Horizon first answered 404 for the pending hash; an unreachable Horizon does not set it. Takes the row out of the beat sweep once older than `PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT`. Cleared by every staging write, every promotion, and `rearm_proposal_payment_check` |
 | status | Choice | Legacy (TODO: remove) |
 | action | Choice | TO_CREATE / TO_UPDATE / TO_SUBMIT / NONE |
 | transaction_hash | CharField(64, unique) | Current/creation payment tx hash |
@@ -393,7 +396,9 @@ so three properties of it are load-bearing:
   deadlock, a programming error. One poisoned row must not stop the rows behind it.
 - **`.order_by('id')` plus a terminal-rejection filter**: rows whose pending hash equals
   `payment_check_rejected_hash` are excluded in SQL, so a permanently-failing row stops
-  costing Horizon traffic. Re-arm one with `manage.py rearm_proposal_payment_check`.
+  costing Horizon traffic. So are rows whose `payment_not_found_since` is older than
+  `PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT`: a hash Horizon has not found for that long. Re-arm
+  one with `manage.py rearm_proposal_payment_check`; `/check_payment/` still asks Horizon.
 
 ### Task Call Chain
 
@@ -514,6 +519,7 @@ Amounts are compared exactly, as `Decimal`. A 900,000 payment does not satisfy a
 |---------|-------|
 | `PROPOSAL_LEGACY_MEMO_ACCEPTED` | `True`. Whether `sha256(text_html)` is still accepted alongside the canonical `AQUA-GOV\|v1\|…` memo. Flip to `False` for v3 — an env flip with a deploy-free rollback, and the step that can strand an in-flight payment |
 | `PROPOSAL_PAYMENT_CHECK_THROTTLE_RATE` | `''` (off), wired to the `proposal_payment_check` DRF throttle scope. **No `CACHES` is configured**, so any rate is per-process locmem multiplied by the worker count — point `CACHES['default']` at Redis before enabling it |
+| `PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT` | 24 h (`PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT_HOURS`). How long the sweep keeps asking Horizon about a pending hash it has never found |
 
 ### Advisory Lock IDs
 
@@ -564,7 +570,7 @@ Both are PostgreSQL advisory locks and both must stay distinct.
 
 14. **Operator commands** (`manage.py`, no other management commands exist):
     - `backfill_consumed_transactions [--dry-run]` — rebuilds the ledger from `Proposal.transaction_hash` and `HistoryProposal.transaction_hash`, skipping in-flight `TO_CREATE` rows. Idempotent; the same code migration `0031` runs. **Mandatory once after any deploy of this app that follows the migration.**
-    - `rearm_proposal_payment_check <id> --action <ACTION> [--unhide]` — clears `payment_check_rejected_hash`, resets `payment_status`, re-sets `action`. The only remedy for a terminal verdict, since `action` and `payment_status` are in `ProposalAdmin.readonly_fields`. Logs the before/after at ERROR; does **not** un-burn a claimed hash and does not restore `draft`.
+    - `rearm_proposal_payment_check <id> --action <ACTION> [--unhide]` — clears `payment_check_rejected_hash` and `payment_not_found_since`, resets `payment_status`, re-sets `action`. The only remedy for a terminal verdict, since `action` and `payment_status` are in `ProposalAdmin.readonly_fields`. Logs the before/after at ERROR; does **not** un-burn a claimed hash and does not restore `draft`.
 
 ---
 
