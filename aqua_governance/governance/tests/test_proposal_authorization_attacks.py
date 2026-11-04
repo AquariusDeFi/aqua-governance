@@ -44,6 +44,8 @@ from aqua_governance.utils.memo import legacy_memo_digest
 
 VICTIM = OWNER
 ATTACKER = OTHER_ACCOUNT
+# 56 characters of the right alphabet, but no checksum: not an account id.
+UNUSABLE_ACCOUNT = 'G' + 'A' * 55
 
 VICTIM_TEXT = '<p>The proposal the owner wrote.</p>'
 ATTACKER_TEXT = '<p>The proposal the attacker wants voted on.</p>'
@@ -182,6 +184,43 @@ class CreatePaymentBindingAttackTests(AuthorizationAttackTestCase):
         self.assertEqual(proposal.payment_status, Proposal.INVALID_PAYMENT)
         self.assertTrue(proposal.hide)
         self.assertNotConsumed(transaction_hash)
+
+    def _assert_create_refuses_an_unusable_account(self, *, path='/api/proposal/', extra=None):
+        """A row no payment can ever bind to is refused before it is stored."""
+        envelope_xdr, transaction_hash = self.burn(
+            amount=CREATE_COST,
+            memo_bytes=legacy_memo_digest(VICTIM_TEXT),
+            settle=False,
+        )
+        response = self._post_create(
+            proposed_by=UNUSABLE_ACCOUNT,
+            title='Proposal by no account',
+            text_html=VICTIM_TEXT,
+            envelope_xdr=envelope_xdr,
+            transaction_hash=transaction_hash,
+            path=path,
+            extra=extra,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('proposed_by', response.data)
+        self.assertFalse(Proposal.objects.exists())
+
+    def test_a_create_for_a_string_that_is_not_an_account_is_refused(self):
+        self._assert_create_refuses_an_unusable_account()
+
+    def test_an_asset_create_for_a_string_that_is_not_an_account_is_refused(self):
+        self._assert_create_refuses_an_unusable_account(
+            path='/api/asset-proposal/',
+            extra=dict(
+                {
+                    'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+                    'asset_code': DEFAULT_CODE,
+                    'asset_issuer': DEFAULT_ISSUER,
+                },
+                **asset_narratives(),
+            ),
+        )
 
     def test_a_creation_payment_cannot_be_spent_a_second_time(self):
         proposal = self._confirmed_proposal(title='Original proposal')
