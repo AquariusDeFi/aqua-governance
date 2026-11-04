@@ -23,7 +23,7 @@ from rest_framework.test import APIClient
 from django_quill.quill import Quill
 
 from aqua_governance.governance import proposal_transactions, tasks
-from aqua_governance.governance.models import ConsumedTransaction, HistoryProposal, Proposal
+from aqua_governance.governance.models import ConsumedTransaction, HistoryProposal, Proposal, ProposalQueueSlot
 from aqua_governance.governance.tests._factories import (
     DEFAULT_PROPOSED_BY,
     distinct_hash,
@@ -31,7 +31,7 @@ from aqua_governance.governance.tests._factories import (
     make_general_proposal,
     patch_ice_circulating_supply,
 )
-from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, PromotionTestCase, verifies
+from aqua_governance.governance.tests._promotions import ALERT, VERIFY_PAYMENT, PromotionTestCase, make, verifies
 from aqua_governance.utils.payments import REASON_HORIZON_UNAVAILABLE, PaymentCheckResult
 
 
@@ -538,7 +538,19 @@ class PaymentNotFoundClockTests(PromotionTestCase):
         mock_verify.assert_not_called()
         proposal.refresh_from_db()
         self.assertEqual(proposal.action, Proposal.TO_UPDATE)
+        self.assertEqual(proposal.payment_status, Proposal.HORIZON_ERROR)
+        self.assertFalse(proposal.hide)
         self.assertIsNone(proposal.payment_check_rejected_hash)
+
+    def test_check_payment_still_asks_horizon_about_an_expired_hash(self):
+        proposal = self.pending_update(1030)
+        self.start_clock(proposal, settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT)
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.HORIZON_ERROR)) as mock_verify:
+            response = self.client.post('/api/proposal/{0}/check_payment/'.format(proposal.id))
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(mock_verify.call_count, 1)
 
     def test_a_repeated_not_found_answer_keeps_the_first_time(self):
         proposal = self.pending_update(950)
@@ -590,6 +602,51 @@ class PaymentNotFoundClockTests(PromotionTestCase):
                 self.assertIn(result['outcome'], {'created', 'updated', 'booked'})
                 proposal.refresh_from_db()
                 self.assertEqual(proposal.action, Proposal.NONE)
+                self.assertIsNone(proposal.payment_not_found_since)
+
+    def test_a_found_payment_that_cannot_be_applied_yet_stops_the_clock(self):
+        # The first sweep tick usually lands before the owner's transaction does, so a
+        # payment that is later found but blocked - a taken queue slot, a same-asset
+        # proposal still in flight - would otherwise be dropped a day after that 404.
+        submit = self.pending_submit(1040)
+        slot_holder = make(
+            transaction_hash=distinct_hash(1050),
+            proposal_status=Proposal.QUEUED,
+            start_at=submit.new_start_at,
+            end_at=submit.new_end_at,
+        )
+        ProposalQueueSlot.objects.create(
+            proposal=slot_holder,
+            start_at=submit.new_start_at,
+            end_at=submit.new_end_at,
+        )
+        make_asset_proposal_raw(
+            proposed_by=DEFAULT_PROPOSED_BY,
+            transaction_hash=distinct_hash(1060),
+            proposal_status=Proposal.QUEUED,
+        )
+        asset_create = make_asset_proposal_raw(
+            proposed_by=DEFAULT_PROPOSED_BY,
+            transaction_hash=distinct_hash(1070),
+            draft=True,
+            action=Proposal.TO_CREATE,
+        )
+
+        for label, proposal, outcome, action in (
+            ('submit', submit, 'slot_conflict', Proposal.TO_SUBMIT),
+            ('asset create', asset_create, 'asset_proposal_conflict', Proposal.TO_CREATE),
+        ):
+            with self.subTest(transition=label):
+                self.start_clock(proposal, timedelta(hours=3))
+                proposal.refresh_from_db()
+
+                with patch(ALERT), patch(VERIFY_PAYMENT, side_effect=verifies()):
+                    result = proposal_transactions.check_transaction(proposal)
+
+                self.assertEqual(result['outcome'], outcome)
+                proposal.refresh_from_db()
+                self.assertEqual(proposal.action, action)
+                self.assertEqual(proposal.payment_status, Proposal.FINE)
                 self.assertIsNone(proposal.payment_not_found_since)
 
     @patch(OWNER_CHECK)

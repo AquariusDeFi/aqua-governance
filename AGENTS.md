@@ -282,7 +282,7 @@ Phase 4 — Bulk DB operations:
 | proposal_type | Choice | GENERAL / ADD_ASSET / REMOVE_ASSET (asset types grouped as `ASSET_PROPOSAL_TYPES`) |
 | payment_status | Choice | FINE / HORIZON_ERROR / BAD_MEMO / INVALID_PAYMENT / FAILED_TRANSACTION |
 | payment_check_rejected_hash | CharField(64, null) | The pending hash a terminal verdict was recorded for; `''` means "there was no hash". Takes the row out of the beat sweep and dedups the operator alert. Cleared by every promotion, and by `manage.py rearm_proposal_payment_check` |
-| payment_not_found_since | DateTimeField(null) | When Horizon first answered 404 for the pending hash; an unreachable Horizon does not set it. Takes the row out of the beat sweep once older than `PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT`. Cleared by every staging write, every promotion, and `rearm_proposal_payment_check` |
+| payment_not_found_since | DateTimeField(null) | When Horizon first answered 404 for the pending hash; an unreachable Horizon does not set it. Takes the row out of the beat sweep once older than `PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT`. Cleared by every staging write, every promotion, a found payment that cannot be applied yet (slot or asset conflict), and `rearm_proposal_payment_check` |
 | status | Choice | Legacy (TODO: remove) |
 | action | Choice | TO_CREATE / TO_UPDATE / TO_SUBMIT / NONE |
 | transaction_hash | CharField(64, unique) | Current/creation payment tx hash |

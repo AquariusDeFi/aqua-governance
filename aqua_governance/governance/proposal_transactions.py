@@ -662,8 +662,11 @@ def _apply_asset_create_transaction(proposal, transition, result):
             if status == proposal.FINE:
                 asset_conflict = find_active_asset_proposal_conflict(proposal=locked_proposal)
                 if asset_conflict is not None:
+                    # A found payment stops the not-found clock, so the sweep keeps retrying
+                    # until the conflicting proposal is done.
                     locked_proposal.payment_status = status
-                    locked_proposal.save(update_fields=['payment_status'])
+                    locked_proposal.payment_not_found_since = None
+                    locked_proposal.save(update_fields=['payment_status', 'payment_not_found_since'])
                     proposal.refresh_from_db()
                     return {
                         'outcome': 'asset_proposal_conflict',
@@ -753,9 +756,15 @@ def _mark_submit_retry_state(proposal, status):
     A conditional UPDATE rather than a ``save()``: the caller's instance has been through a
     Horizon round trip and, on the booking-recovery path, through a rolled-back savepoint,
     so writing the whole row would revert whatever a concurrent request wrote meanwhile.
+    Horizon has found the payment, so the not-found clock stops and the sweep keeps
+    retrying the transition.
     """
-    type(proposal).objects.filter(id=proposal.id, action=proposal.TO_SUBMIT).update(payment_status=status)
+    type(proposal).objects.filter(id=proposal.id, action=proposal.TO_SUBMIT).update(
+        payment_status=status,
+        payment_not_found_since=None,
+    )
     proposal.payment_status = status
+    proposal.payment_not_found_since = None
 
 
 def _resolve_submit_proposal_status(source_proposal, transition, now):
