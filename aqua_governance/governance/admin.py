@@ -40,12 +40,12 @@ class ProposalAdmin(admin.ModelAdmin):
         'onchain_execution_status', 'onchain_execution_tx_hash',
         'onchain_execution_started_at', 'onchain_execution_submitted_at', 'onchain_execution_poll_count',
         'new_title', 'new_text', 'new_transaction_hash', 'new_envelope_xdr', 'new_start_at', 'new_end_at',
-        'payment_check_rejected_hash',
+        'payment_check_rejected_hash', 'payment_not_found_since',
     ]
     search_fields = ['proposed_by', 'title', 'transaction_hash', 'new_transaction_hash']
     fields = [
         'proposed_by', 'title', 'text', 'proposal_type', 'is_simple_proposal', 'hide', 'draft', 'status', 'action',
-        'proposal_status', 'payment_status', 'payment_check_rejected_hash',
+        'proposal_status', 'payment_status', 'payment_check_rejected_hash', 'payment_not_found_since',
         'version', 'created_at', 'last_updated_at',
         'transaction_hash', 'envelope_xdr', 'start_at', 'end_at',
         'new_title', 'new_text', 'new_transaction_hash', 'new_envelope_xdr', 'new_start_at', 'new_end_at',

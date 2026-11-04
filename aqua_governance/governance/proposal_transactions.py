@@ -26,6 +26,8 @@ import re
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, OperationalError, transaction
+from django.db.models import Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from django_quill.quill import Quill
@@ -46,7 +48,7 @@ from aqua_governance.governance.proposal_constants import (
 from aqua_governance.governance.proposal_queue import validate_weekly_queue_slot
 from aqua_governance.governance.proposal_queue_slots import find_queue_slot_conflict, sync_proposal_queue_slot
 from aqua_governance.governance.transitions import CreateTransition, SubmitTransition, UpdateTransition
-from aqua_governance.utils.payments import verify_payment
+from aqua_governance.utils.payments import REASON_TRANSACTION_NOT_FOUND, verify_payment
 
 
 logger = logging.getLogger(__name__)
@@ -134,12 +136,20 @@ def _persist_terminal_verdict(proposal, *, expected_action, status, transaction_
     return bool(updated)
 
 
-def _persist_retryable_verdict(proposal, *, expected_action, status):
-    """A non-terminal HORIZON_ERROR: same action guard, but no rejection is recorded."""
+def _persist_retryable_verdict(proposal, *, expected_action, status, not_found):
+    """A non-terminal HORIZON_ERROR: same action guard, but no rejection is recorded.
+
+    A "not found" answer starts the clock the beat sweep gives up on, and a repeat keeps
+    the first time.  An unreachable Horizon proves nothing about the hash, so it leaves the
+    clock alone.
+    """
+    fields = {'payment_status': status}
+    if not_found:
+        fields['payment_not_found_since'] = Coalesce('payment_not_found_since', Value(timezone.now()))
     return bool(type(proposal).objects.filter(
         id=proposal.id,
         action=expected_action,
-    ).update(payment_status=status))
+    ).update(**fields))
 
 
 def _terminal_create_fields(proposal, expected_action):
@@ -257,7 +267,12 @@ def _reject_payment(proposal, expected_action, transition, result):
     """Persist and report a non-FINE verdict for a transition that was not applied."""
     status = result.payment_status
     if status == payment_statuses.HORIZON_ERROR:
-        if _persist_retryable_verdict(proposal, expected_action=expected_action, status=status):
+        if _persist_retryable_verdict(
+            proposal,
+            expected_action=expected_action,
+            status=status,
+            not_found=result.reason == REASON_TRANSACTION_NOT_FOUND,
+        ):
             proposal.refresh_from_db()
         return {'outcome': 'payment_not_confirmed', 'payment_status': status}
 
@@ -412,6 +427,7 @@ def _apply_update_confirmation(proposal, transition, status):
     )
     proposal.payment_status = status
     proposal.payment_check_rejected_hash = None
+    proposal.payment_not_found_since = None
     proposal.last_updated_at = timezone.now()
     proposal.text = _quill_from_html(transition.text_html)
     proposal.title = transition.title
@@ -612,6 +628,7 @@ def _check_create_transaction(proposal):
             locked_proposal.action = proposal.NONE
             locked_proposal.payment_status = status
             locked_proposal.payment_check_rejected_hash = None
+            locked_proposal.payment_not_found_since = None
             locked_proposal.save()
             _claim(locked_proposal, transition, result, CONSUMED_TRANSACTION_PURPOSE_CREATE)
     except IntegrityError:
@@ -667,6 +684,7 @@ def _apply_asset_create_transaction(proposal, transition, result):
                 locked_proposal.payment_check_rejected_hash = rejection_marker
             else:
                 locked_proposal.payment_check_rejected_hash = None
+                locked_proposal.payment_not_found_since = None
             locked_proposal.payment_status = status
             locked_proposal.save()
             if status == proposal.FINE:
@@ -712,6 +730,7 @@ def _apply_submit_confirmation(
     _create_submit_history(source_proposal, proposal)
     proposal.payment_status = status
     proposal.payment_check_rejected_hash = None
+    proposal.payment_not_found_since = None
     proposal.start_at = transition.start_at
     proposal.end_at = transition.end_at
     proposal.proposal_status = proposal_status

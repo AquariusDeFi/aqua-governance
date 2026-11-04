@@ -159,7 +159,9 @@ def task_check_pending_proposal_payments():
         # A row whose pending hash is the one already terminally rejected can never
         # resolve differently, so it is filtered out in SQL rather than re-asked of
         # Horizon every minute.  The F comparison is NULL for a row that was never
-        # rejected, and Django's NOT (...) keeps such a row in the sweep.
+        # rejected, and Django's NOT (...) keeps such a row in the sweep.  A pending hash
+        # Horizon has not found for the whole timeout leaves the sweep the same way; the
+        # owner's /check_payment/ call still asks Horizon about it.
         proposals = (
             Proposal.objects.filter(hide=False)
             .exclude(action=Proposal.NONE)
@@ -170,6 +172,9 @@ def task_check_pending_proposal_payments():
             .exclude(
                 ~Q(action=Proposal.TO_CREATE),
                 new_transaction_hash=F('payment_check_rejected_hash'),
+            )
+            .exclude(
+                payment_not_found_since__lte=timezone.now() - settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT,
             )
             .order_by('id')
         )

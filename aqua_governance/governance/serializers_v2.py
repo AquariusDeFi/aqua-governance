@@ -673,8 +673,9 @@ class ProposalUpdateSerializer(serializers.ModelSerializer):  # think about join
         validated_data["payment_status"] = status
         # Any staging write re-arms the beat sweep: the marker records the hash whose
         # verdict was terminal, and re-staging the same hash with corrected content is the
-        # normal recovery from a memo or payer mismatch.
+        # normal recovery from a memo or payer mismatch.  The not-found clock restarts too.
         validated_data["payment_check_rejected_hash"] = None
+        validated_data["payment_not_found_since"] = None
         return super().update(instance, validated_data)
 
 
@@ -827,8 +828,9 @@ class SubmitSerializer(serializers.ModelSerializer):
         validated_data["payment_status"] = status
         # Any staging write re-arms the beat sweep: the marker records the hash whose
         # verdict was terminal, and re-staging the same hash with corrected content is the
-        # normal recovery from a memo or payer mismatch.
+        # normal recovery from a memo or payer mismatch.  The not-found clock restarts too.
         validated_data["payment_check_rejected_hash"] = None
+        validated_data["payment_not_found_since"] = None
 
         with transaction.atomic():
             acquire_proposal_transition_lock()
