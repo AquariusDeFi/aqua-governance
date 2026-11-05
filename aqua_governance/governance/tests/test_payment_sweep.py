@@ -7,6 +7,7 @@ safe, and adds a claim rejection, a deadlock and every programming error as rais
 inside it.
 """
 import json
+from datetime import timedelta
 from io import StringIO
 from unittest.mock import call, patch
 
@@ -21,14 +22,17 @@ from rest_framework.test import APIClient
 
 from django_quill.quill import Quill
 
-from aqua_governance.governance import tasks
-from aqua_governance.governance.models import ConsumedTransaction, HistoryProposal, Proposal
+from aqua_governance.governance import proposal_transactions, tasks
+from aqua_governance.governance.models import ConsumedTransaction, HistoryProposal, Proposal, ProposalQueueSlot
 from aqua_governance.governance.tests._factories import (
     DEFAULT_PROPOSED_BY,
     distinct_hash,
+    make_asset_proposal_raw,
     make_general_proposal,
     patch_ice_circulating_supply,
 )
+from aqua_governance.governance.tests._promotions import ALERT, VERIFY_PAYMENT, PromotionTestCase, make, verifies
+from aqua_governance.utils.payments import REASON_HORIZON_UNAVAILABLE, PaymentCheckResult
 
 
 CHECK_TRANSACTION = 'aqua_governance.governance.proposal_transactions.check_transaction'
@@ -40,6 +44,11 @@ RELEASE = 'aqua_governance.governance.tasks._release_payment_sweep_lock'
 
 def _quill(html):
     return Quill(json.dumps({'delta': '', 'html': html}))
+
+
+def not_found_since(age):
+    """A not-found clock that started ``age`` ago."""
+    return timezone.now() - age
 
 
 def sweep_lock_is_held():
@@ -265,6 +274,27 @@ class PaymentSweepSelectionTests(ProposalSweepBase):
         self.assertIsNone(proposal.payment_check_rejected_hash)
         self.assertIn(proposal.id, self.swept_ids())
 
+    def test_a_hash_not_found_for_the_whole_timeout_is_not_swept(self):
+        create = self.pending(900, action=Proposal.TO_CREATE, draft=True, new_transaction_hash=None)
+        submit = self.pending(910, action=Proposal.TO_SUBMIT)
+        Proposal.objects.filter(id__in=[create.id, submit.id]).update(
+            payment_status=Proposal.HORIZON_ERROR,
+            payment_not_found_since=not_found_since(settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT),
+        )
+
+        swept = self.swept_ids()
+        self.assertNotIn(create.id, swept)
+        self.assertNotIn(submit.id, swept)
+
+    def test_a_hash_not_found_for_less_than_the_timeout_is_still_swept(self):
+        proposal = self.pending(920)
+        Proposal.objects.filter(id=proposal.id).update(
+            payment_status=Proposal.HORIZON_ERROR,
+            payment_not_found_since=not_found_since(settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT - timedelta(minutes=5)),
+        )
+
+        self.assertIn(proposal.id, self.swept_ids())
+
     def test_hidden_and_actionless_rows_stay_out_of_the_sweep(self):
         hidden = self.pending(570, hide=True)
         idle = self.pending(580, action=Proposal.NONE)
@@ -387,6 +417,24 @@ class RearmProposalPaymentCheckCommandTests(ProposalSweepBase):
         # rejection left it.
         self.assertFalse(proposal.draft)
 
+    def test_it_restarts_the_not_found_clock(self):
+        proposal = self.pending(930, action=Proposal.TO_CREATE, draft=True, new_transaction_hash=None)
+        Proposal.objects.filter(id=proposal.id).update(
+            payment_status=Proposal.HORIZON_ERROR,
+            payment_not_found_since=not_found_since(settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT),
+        )
+
+        call_command(
+            'rearm_proposal_payment_check', proposal.id,
+            action=Proposal.TO_CREATE, stdout=StringIO(),
+        )
+
+        proposal.refresh_from_db()
+        self.assertIsNone(proposal.payment_not_found_since)
+        with patch(CHECK_TRANSACTION, return_value=None) as mock_check:
+            tasks.task_check_pending_proposal_payments()
+        self.assertIn(proposal.id, {args[0].id for args, _kwargs in mock_check.call_args_list})
+
     def test_hide_survives_unless_unhide_is_asked_for(self):
         proposal = self.pending(720, hide=True)
 
@@ -454,6 +502,194 @@ class RearmProposalPaymentCheckCommandTests(ProposalSweepBase):
 
         proposal.refresh_from_db()
         self.assertEqual(proposal.payment_status, Proposal.INVALID_PAYMENT)
+
+
+class PaymentNotFoundClockTests(PromotionTestCase):
+    """The clock that retires a pending hash Horizon has never found.
+
+    Horizon answers 404 for a transaction that never reached the network, and that answer is
+    retryable: the payment may land a moment after staging.  It stops being retryable once
+    the hash has stayed unknown for ``PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT``.
+    """
+
+    def start_clock(self, proposal, age):
+        Proposal.objects.filter(id=proposal.id).update(
+            payment_status=Proposal.HORIZON_ERROR,
+            payment_not_found_since=not_found_since(age),
+        )
+
+    def test_the_sweep_stops_asking_about_a_hash_not_found_for_the_timeout(self):
+        proposal = self.pending_update(940)
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.HORIZON_ERROR)) as mock_verify:
+            tasks.task_check_pending_proposal_payments()
+
+        self.assertEqual(mock_verify.call_count, 1)
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.payment_status, Proposal.HORIZON_ERROR)
+        self.assertIsNotNone(proposal.payment_not_found_since)
+
+        Proposal.objects.filter(id=proposal.id).update(
+            payment_not_found_since=proposal.payment_not_found_since - settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT,
+        )
+        with patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.HORIZON_ERROR)) as mock_verify:
+            tasks.task_check_pending_proposal_payments()
+
+        mock_verify.assert_not_called()
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.action, Proposal.TO_UPDATE)
+        self.assertEqual(proposal.payment_status, Proposal.HORIZON_ERROR)
+        self.assertFalse(proposal.hide)
+        self.assertIsNone(proposal.payment_check_rejected_hash)
+
+    def test_check_payment_still_asks_horizon_about_an_expired_hash(self):
+        proposal = self.pending_update(1030)
+        self.start_clock(proposal, settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT)
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.HORIZON_ERROR)) as mock_verify:
+            response = self.client.post('/api/proposal/{0}/check_payment/'.format(proposal.id))
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(mock_verify.call_count, 1)
+
+    def test_a_repeated_not_found_answer_keeps_the_first_time(self):
+        proposal = self.pending_update(950)
+        self.start_clock(proposal, timedelta(hours=3))
+        proposal.refresh_from_db()
+        first_seen = proposal.payment_not_found_since
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies(Proposal.HORIZON_ERROR)):
+            proposal_transactions.check_transaction(proposal)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.payment_not_found_since, first_seen)
+
+    def test_an_unreachable_horizon_does_not_start_the_clock(self):
+        proposal = self.pending_update(960)
+        unreachable = PaymentCheckResult(
+            payment_status=Proposal.HORIZON_ERROR,
+            reason=REASON_HORIZON_UNAVAILABLE,
+            transaction_hash=proposal.new_transaction_hash,
+        )
+
+        with patch(VERIFY_PAYMENT, return_value=unreachable):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'payment_not_confirmed')
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.payment_status, Proposal.HORIZON_ERROR)
+        self.assertIsNone(proposal.payment_not_found_since)
+
+    def test_a_promotion_clears_the_clock(self):
+        for label, proposal in (
+            ('create', self.pending_create(970)),
+            ('update', self.pending_update(980)),
+            ('submit', self.pending_submit(990)),
+            ('asset create', make_asset_proposal_raw(
+                proposed_by=DEFAULT_PROPOSED_BY,
+                transaction_hash=distinct_hash(1000),
+                draft=True,
+                action=Proposal.TO_CREATE,
+            )),
+        ):
+            with self.subTest(transition=label):
+                self.start_clock(proposal, timedelta(hours=3))
+                proposal.refresh_from_db()
+
+                with patch(VERIFY_PAYMENT, side_effect=verifies()):
+                    result = proposal_transactions.check_transaction(proposal)
+
+                self.assertIn(result['outcome'], {'created', 'updated', 'booked'})
+                proposal.refresh_from_db()
+                self.assertEqual(proposal.action, Proposal.NONE)
+                self.assertIsNone(proposal.payment_not_found_since)
+
+    def test_a_found_payment_that_cannot_be_applied_yet_stops_the_clock(self):
+        # The first sweep tick usually lands before the owner's transaction does, so a
+        # payment that is later found but blocked - a taken queue slot, a same-asset
+        # proposal still in flight - would otherwise be dropped a day after that 404.
+        submit = self.pending_submit(1040)
+        slot_holder = make(
+            transaction_hash=distinct_hash(1050),
+            proposal_status=Proposal.QUEUED,
+            start_at=submit.new_start_at,
+            end_at=submit.new_end_at,
+        )
+        ProposalQueueSlot.objects.create(
+            proposal=slot_holder,
+            start_at=submit.new_start_at,
+            end_at=submit.new_end_at,
+        )
+        make_asset_proposal_raw(
+            proposed_by=DEFAULT_PROPOSED_BY,
+            transaction_hash=distinct_hash(1060),
+            proposal_status=Proposal.QUEUED,
+        )
+        asset_create = make_asset_proposal_raw(
+            proposed_by=DEFAULT_PROPOSED_BY,
+            transaction_hash=distinct_hash(1070),
+            draft=True,
+            action=Proposal.TO_CREATE,
+        )
+
+        for label, proposal, outcome, action in (
+            ('submit', submit, 'slot_conflict', Proposal.TO_SUBMIT),
+            ('asset create', asset_create, 'asset_proposal_conflict', Proposal.TO_CREATE),
+        ):
+            with self.subTest(transition=label):
+                self.start_clock(proposal, timedelta(hours=3))
+                proposal.refresh_from_db()
+
+                with patch(ALERT), patch(VERIFY_PAYMENT, side_effect=verifies()):
+                    result = proposal_transactions.check_transaction(proposal)
+
+                self.assertEqual(result['outcome'], outcome)
+                proposal.refresh_from_db()
+                self.assertEqual(proposal.action, action)
+                self.assertEqual(proposal.payment_status, Proposal.FINE)
+                self.assertIsNone(proposal.payment_not_found_since)
+
+    @patch(OWNER_CHECK)
+    @patch(INSPECT_ENVELOPE, return_value=Proposal.FINE)
+    def test_re_staging_an_update_restarts_the_clock(self, _mock_inspect, _mock_owner):
+        proposal = self.pending_update(1010)
+        self.start_clock(proposal, settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT)
+
+        response = self.client.put(
+            '/api/proposal/{0}/'.format(proposal.id),
+            {
+                'new_title': 'Staged title',
+                'new_text': '<p>Staged text</p>',
+                'new_transaction_hash': proposal.new_transaction_hash,
+                'new_envelope_xdr': 'update-xdr',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        proposal.refresh_from_db()
+        self.assertIsNone(proposal.payment_not_found_since)
+
+    @patch(OWNER_CHECK)
+    @patch(INSPECT_ENVELOPE, return_value=Proposal.FINE)
+    def test_re_staging_a_submit_restarts_the_clock(self, _mock_inspect, _mock_owner):
+        proposal = self.pending_submit(1020)
+        self.start_clock(proposal, settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT)
+
+        response = self.client.post(
+            '/api/proposal/{0}/submit/'.format(proposal.id),
+            {
+                'start_at': proposal.new_start_at.isoformat().replace('+00:00', 'Z'),
+                'end_at': proposal.new_end_at.isoformat().replace('+00:00', 'Z'),
+                'new_envelope_xdr': 'submit-xdr',
+                'new_transaction_hash': proposal.new_transaction_hash,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        proposal.refresh_from_db()
+        self.assertIsNone(proposal.payment_not_found_since)
 
 
 class SweepCallShapeTests(ProposalSweepBase):

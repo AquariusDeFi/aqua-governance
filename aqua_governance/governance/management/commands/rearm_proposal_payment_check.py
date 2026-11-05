@@ -3,7 +3,9 @@
 A terminal verdict records `payment_check_rejected_hash`, which takes the row out of the
 sweep for good, and `ProposalAdmin.readonly_fields` makes `action`, `payment_status` and
 the rejection marker uneditable even for a superuser.  Without this command an over-payer
-the exact-amount rule rejected has no remedy short of a database shell.
+the exact-amount rule rejected has no remedy short of a database shell.  A pending hash
+Horizon has not found for `PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT` leaves the sweep too, and
+re-arming restarts that clock.
 
 It is deliberately narrow: it re-arms the payment check and nothing else.  It does not
 promote a transition, does not touch a hash column, and does not release a burned hash -
@@ -52,12 +54,14 @@ class Command(BaseCommand):
                 'action': proposal.action,
                 'payment_status': proposal.payment_status,
                 'payment_check_rejected_hash': proposal.payment_check_rejected_hash,
+                'payment_not_found_since': proposal.payment_not_found_since,
                 'hide': proposal.hide,
             }
             fields = {
                 'action': options['action'],
                 'payment_status': Proposal.FINE,
                 'payment_check_rejected_hash': None,
+                'payment_not_found_since': None,
             }
             if options['unhide']:
                 fields['hide'] = False

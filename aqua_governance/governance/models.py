@@ -194,6 +194,10 @@ class Proposal(AssetProposalInfo):
     # things clear it: staging a different hash stops the comparison matching, any staging
     # write resets it, and so does every promotion.
     payment_check_rejected_hash = models.CharField(max_length=64, null=True, blank=True)
+    # When Horizon first answered that the pending hash does not exist.  The beat sweep stops
+    # asking about a hash that has stayed unknown for PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT.
+    # Staging, promotion and the re-arm command clear it, so each attempt starts a new clock.
+    payment_not_found_since = models.DateTimeField(null=True, blank=True)
 
     vote_for_result = models.DecimalField(decimal_places=7, max_digits=20, default=0, blank=True, null=True)
     vote_against_result = models.DecimalField(decimal_places=7, max_digits=20, default=0, blank=True, null=True)
