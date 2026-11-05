@@ -226,6 +226,10 @@ PROPOSAL_COST = env.int('PROPOSAL_COST', default=1000000)  # TODO: remove it
 PROPOSAL_SUBMIT_COST = env.int('PROPOSAL_SUBMIT_COST', default=900000)
 PROPOSAL_CREATE_OR_UPDATE_COST = env.int('PROPOSAL_CREATE_OR_UPDATE_COST', default=100000)
 PROPOSAL_LEGACY_MEMO_ACCEPTED = env.bool('PROPOSAL_LEGACY_MEMO_ACCEPTED', default=True)
+# How long the payment sweep keeps asking Horizon about a pending hash it has never found.
+PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT = timedelta(
+    hours=env.int('PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT_HOURS', default=24),
+)
 
 EXPIRED_TIME = timedelta(days=env.int('EXPIRED_TIME_DAYS', default=30))
 DISCUSSION_TIME = timedelta(days=env.int('DISCUSSION_TIME_DAYS', default=7))

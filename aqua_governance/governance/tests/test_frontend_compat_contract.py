@@ -426,33 +426,3 @@ class FrontendCompatContractTests(OnChainTestCase):
 
         self.assertEqual(listing.status_code, 200)
         self.assertIn('results', listing.data)
-
-    def test_the_shared_test_route_enforces_the_same_payer_binding(self):
-        """``api/test/proposal/`` subclasses the viewset, so it inherits every check.
-
-        Only the URL literals in these tests are route-specific, which is why one attack is
-        driven through the other route rather than trusted to shared code.
-        """
-        envelope_xdr, transaction_hash = self._burn(
-            amount=CREATE_COST, text_html=PROPOSAL_TEXT, source=OTHER_ACCOUNT)
-        response = self._record(self.client.post('/api/proposal/', {
-            'proposed_by': OWNER,
-            'title': 'Proposal paid for by someone else',
-            'text': PROPOSAL_TEXT,
-            'start_at': None,
-            'end_at': None,
-            'transaction_hash': transaction_hash,
-            'discord_username': 'browser-user',
-            'envelope_xdr': envelope_xdr,
-        }, format='json'))
-        self.assertEqual(response.status_code, 201, response.data)
-        proposal = Proposal.objects.get(id=response.data['id'])
-
-        confirmation = self._confirm(
-            proposal, path='/api/test/proposal/{0}/check_payment/')
-
-        self.assertEqual(confirmation.status_code, 200, confirmation.data)
-        self.assertEqual(confirmation.data['payment_status'], payment_statuses.INVALID_PAYMENT)
-        proposal.refresh_from_db()
-        self.assertTrue(proposal.hide)
-        self.assertFalse(ConsumedTransaction.objects.exists())

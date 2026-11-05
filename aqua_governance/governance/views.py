@@ -248,10 +248,6 @@ class AssetProposalViewSet(CreateModelMixin, GenericViewSet):
     queryset = Proposal.objects.filter(hide=False).exclude(id=65)
 
 
-class TestProposalViewSet(ProposalViewSet):
-    queryset = Proposal.objects.filter(hide=False)
-
-
 class ProposalQueueViewSet(ListModelMixin, GenericViewSet):
     permission_classes = (AllowAny,)
     pagination_class = CustomPageNumberPagination

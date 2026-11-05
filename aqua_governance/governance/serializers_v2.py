@@ -24,7 +24,7 @@ from aqua_governance.governance.proposal_queue_slots import is_queue_slot_availa
 from aqua_governance.governance.serializer_fields import QuillField, TransactionHashField
 from aqua_governance.governance.serializers import HistoryProposalSerializer, LogVoteSerializer
 from aqua_governance.utils.memo import PURPOSE_CREATE, PURPOSE_SUBMIT, PURPOSE_UPDATE, build_memo_expectation
-from aqua_governance.utils.payments import inspect_envelope
+from aqua_governance.utils.payments import inspect_envelope, normalize_account_id
 
 # ---------------------------------------------------------------------------
 # Asset field constants (shared by validation helpers)
@@ -108,6 +108,20 @@ def _reject_hash_already_seen(value, *, other_column):
 
     if ConsumedTransaction.objects.filter(transaction_hash__iexact=value).exists():
         raise ValidationError('This transaction has already been used for a proposal transition.')
+
+    return value
+
+
+def _reject_unusable_account(value):
+    """Reject a ``proposed_by`` that is not a Stellar account id.
+
+    The value is stored as sent.  The column holds 56 characters, so a muxed ``M…`` never
+    reaches this check, and a ``G…`` that decodes is already its own normalised form.
+    """
+    try:
+        normalize_account_id(value)
+    except ValueError as exc:
+        raise ValidationError('Enter a valid Stellar account id.') from exc
 
     return value
 
@@ -379,6 +393,9 @@ class ProposalCreateSerializer(serializers.ModelSerializer):
     def validate_transaction_hash(self, value):
         return _reject_hash_already_seen(value, other_column="new_transaction_hash")
 
+    def validate_proposed_by(self, value):
+        return _reject_unusable_account(value)
+
     def validate(self, attrs):
         proposal_type = attrs.get("proposal_type", Proposal.PROPOSAL_TYPE_GENERAL)
 
@@ -441,6 +458,9 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
 
     def validate_transaction_hash(self, value):
         return _reject_hash_already_seen(value, other_column="new_transaction_hash")
+
+    def validate_proposed_by(self, value):
+        return _reject_unusable_account(value)
 
     class Meta:
         model = Proposal
@@ -653,8 +673,9 @@ class ProposalUpdateSerializer(serializers.ModelSerializer):  # think about join
         validated_data["payment_status"] = status
         # Any staging write re-arms the beat sweep: the marker records the hash whose
         # verdict was terminal, and re-staging the same hash with corrected content is the
-        # normal recovery from a memo or payer mismatch.
+        # normal recovery from a memo or payer mismatch.  The not-found clock restarts too.
         validated_data["payment_check_rejected_hash"] = None
+        validated_data["payment_not_found_since"] = None
         return super().update(instance, validated_data)
 
 
@@ -807,8 +828,9 @@ class SubmitSerializer(serializers.ModelSerializer):
         validated_data["payment_status"] = status
         # Any staging write re-arms the beat sweep: the marker records the hash whose
         # verdict was terminal, and re-staging the same hash with corrected content is the
-        # normal recovery from a memo or payer mismatch.
+        # normal recovery from a memo or payer mismatch.  The not-found clock restarts too.
         validated_data["payment_check_rejected_hash"] = None
+        validated_data["payment_not_found_since"] = None
 
         with transaction.atomic():
             acquire_proposal_transition_lock()
