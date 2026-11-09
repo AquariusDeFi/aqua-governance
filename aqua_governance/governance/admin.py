@@ -161,7 +161,8 @@ class ProposalAdmin(admin.ModelAdmin):
             obj,
             create_missing=self._should_create_missing_queue_slot(form=form, change=change),
         )
-        if obj.is_asset_proposal:
+        # Unpaid, rejected and re-armed rows get their token when a payment is verified.
+        if obj.is_asset_proposal and not obj.draft and obj.action == Proposal.NONE and obj.payment_status == Proposal.FINE:
             upsert_asset_token_from_proposal(obj, save=True)
 
     @staticmethod
@@ -365,7 +366,7 @@ class AssetTokenAdmin(admin.ModelAdmin):
                                 'classic_code': message,
                                 'classic_issuer': message,
                             })
-                        if 'does not match' in message:
+                        if 'does not match' in message or 'valid Soroban contract address' in message:
                             raise ValidationError({'contract_address': message})
                         raise ValidationError(message)
                     return cleaned_data

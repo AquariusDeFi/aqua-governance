@@ -119,6 +119,19 @@ class ProposalVoteOwnerFilterBackend(BaseFilterBackend):
         return queryset.prefetch_related(build_logvote_prefetch(request))
 
 
+class AssetTokenWhitelistedFilterBackend(BaseFilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        whitelisted_value = request.query_params.get('whitelisted', '').strip().lower()
+
+        if whitelisted_value == 'true':
+            return queryset.filter(whitelisted=True)
+
+        if whitelisted_value == 'false':
+            return queryset.filter(whitelisted=False)
+
+        return queryset
+
+
 class LogVoteOwnerFilterBackend(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         public_key = request.query_params.get('owner_public_key')

@@ -19,6 +19,7 @@ from stellar_sdk import TransactionEnvelope
 from aqua_governance.governance import proposal_transactions
 from aqua_governance.governance.exceptions import build_asset_proposal_conflict_detail
 from aqua_governance.governance.filters import (
+    AssetTokenWhitelistedFilterBackend,
     ProposalStatusFilterBackend,
     ProposalOwnerFilterBackend,
     ProposalTypeFilterBackend,
@@ -47,6 +48,7 @@ class AssetTokenView(ListModelMixin, GenericViewSet):
     permission_classes = (AllowAny,)
     pagination_class = CustomPageNumberPagination
     serializer_class = AssetTokenSerializer
+    filter_backends = (AssetTokenWhitelistedFilterBackend,)
 
     def get_queryset(self):
         linked_proposals = Proposal.objects.filter(

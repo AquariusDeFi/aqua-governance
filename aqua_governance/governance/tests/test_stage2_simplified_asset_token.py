@@ -1,5 +1,6 @@
 import json
 from datetime import timedelta
+from io import StringIO
 from unittest.mock import Mock, patch
 
 from django.contrib import admin
@@ -7,25 +8,38 @@ from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser, Permission
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.management import call_command
 from django.test import RequestFactory, TestCase
 from django.utils import timezone
 from django_quill.quill import Quill
 from rest_framework.test import APIClient
 from stellar_sdk import Asset
 
+from aqua_governance.governance import proposal_transactions, tasks
 from aqua_governance.governance.admin import AssetTokenAdmin, ProposalAdmin
 from aqua_governance.governance.asset_tokens import (
     apply_asset_proposal_result_to_token,
     upsert_asset_token_from_proposal,
 )
-from aqua_governance.governance.models import AssetToken, Proposal
+from aqua_governance.governance.models import AssetToken, ConsumedTransaction, Proposal
+from aqua_governance.governance.proposal_queue import get_queue_week_start
 from aqua_governance.governance.tasks import _sync_asset_token_on_success
-from aqua_governance.governance.tests._factories import asset_narratives, patch_ice_circulating_supply
+from aqua_governance.governance.tests._factories import (
+    asset_narratives,
+    distinct_hash,
+    make_asset_proposal_raw,
+    patch_ice_circulating_supply,
+)
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, PromotionTestCase, quill, verifies
 
 
 DEFAULT_PROPOSED_BY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'
 DEFAULT_CODE = 'AQUA'
 DEFAULT_ISSUER = 'GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA'
+VALID_CONTRACT_ADDRESS = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM'
+ACCOUNT_ADDRESS = 'GCZ3PVJTKLUB724VUS2ZZZCG3NAYBS75BMBJ6RG3OLPXKC23ISKWLZTI'
+INVALID_CONTRACT_ADDRESS_ERROR = 'asset_contract_address must be a valid Soroban contract address.'
 
 
 def quill_text(html='<p>x</p>'):
@@ -92,7 +106,7 @@ class SimplifiedAssetTokenTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('asset_code', response.data)
 
-    def test_asset_create_links_asset_token(self):
+    def test_asset_create_stores_derived_address_and_writes_no_token(self):
         payload = {
             'proposed_by': DEFAULT_PROPOSED_BY,
             'title': 'Asset proposal',
@@ -114,8 +128,8 @@ class SimplifiedAssetTokenTests(TestCase):
         derived = Asset(DEFAULT_CODE, DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE)
         self.assertEqual(proposal.proposal_type, Proposal.PROPOSAL_TYPE_ADD_ASSET)
         self.assertEqual(proposal.asset_contract_address, derived)
-        self.assertEqual(proposal.asset_token_id, derived)
-        self.assertTrue(AssetToken.objects.filter(contract_address=derived).exists())
+        self.assertIsNone(proposal.asset_token_id)
+        self.assertFalse(AssetToken.objects.exists())
 
     def test_asset_token_view_uses_stored_tokens_and_nulls_last(self):
         executed = AssetToken.objects.create(
@@ -388,6 +402,93 @@ class SimplifiedAssetTokenTests(TestCase):
         # contains that substring, so the mismatch surfaces on asset_issuer.
         self.assertIn('asset_issuer', response.data)
 
+    def _post_contract_only_asset_proposal(self, asset_contract_address, transaction_hash):
+        payload = {
+            'proposed_by': DEFAULT_PROPOSED_BY,
+            'title': 'Asset proposal',
+            'text': '<p>x</p>',
+            'transaction_hash': transaction_hash,
+            'envelope_xdr': 'xdr',
+            'discord_username': 'user',
+            'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            'asset_contract_address': asset_contract_address,
+            **asset_narratives(),
+        }
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
+            return APIClient().post('/api/asset-proposal/', payload, format='json')
+
+    def test_asset_create_rejects_account_address_as_contract_address(self):
+        response = self._post_contract_only_asset_proposal(ACCOUNT_ADDRESS, 'c' * 64)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            [str(error) for error in response.data['asset_contract_address']],
+            [INVALID_CONTRACT_ADDRESS_ERROR],
+        )
+        self.assertFalse(Proposal.objects.exists())
+        self.assertFalse(AssetToken.objects.exists())
+
+    def test_asset_create_accepts_contract_address_without_classic_pair(self):
+        response = self._post_contract_only_asset_proposal(VALID_CONTRACT_ADDRESS, 'd' * 64)
+
+        self.assertEqual(response.status_code, 201)
+        proposal = Proposal.objects.get(id=response.data['id'])
+        self.assertEqual(proposal.asset_contract_address, VALID_CONTRACT_ADDRESS)
+        self.assertIsNone(proposal.asset_token_id)
+        self.assertFalse(AssetToken.objects.exists())
+
+    def _create_proposal_linked_to_account_address_token(self):
+        token = AssetToken.objects.create(contract_address=ACCOUNT_ADDRESS)
+        return create_proposal(
+            proposal_type=Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            asset_contract_address=ACCOUNT_ADDRESS,
+            asset_token=token,
+            **asset_narratives(),
+        )
+
+    def test_clean_reports_stored_account_address_as_validation_error(self):
+        proposal = self._create_proposal_linked_to_account_address_token()
+
+        with self.assertRaises(ValidationError) as context:
+            proposal.clean()
+
+        self.assertEqual(context.exception.messages, [INVALID_CONTRACT_ADDRESS_ERROR])
+
+    def test_admin_change_form_reports_stored_account_address_as_form_error(self):
+        proposal = self._create_proposal_linked_to_account_address_token()
+        request = RequestFactory().post('/admin/')
+        request.user = get_user_model().objects.create_user(
+            username='change_form_admin', password='password', is_staff=True, is_superuser=True,
+        )
+        form_class = ProposalAdmin(Proposal, admin.site).get_form(request, obj=proposal, change=True)
+        form = form_class(
+            data={
+                'title': proposal.title,
+                'text': json.dumps({'delta': '', 'html': '<p>x</p>'}),
+                'discord_username': 'admin',
+                **asset_narratives(),
+            },
+            instance=proposal,
+        )
+
+        self.assertNotIn('asset_contract_address', form.fields)
+        self.assertFalse(form.is_valid())
+        self.assertIn(INVALID_CONTRACT_ADDRESS_ERROR, form.non_field_errors())
+
+    def test_asset_tokens_list_keeps_stored_account_address_row(self):
+        self._create_proposal_linked_to_account_address_token()
+
+        unfiltered = APIClient().get('/api/asset-tokens/')
+        whitelisted = APIClient().get('/api/asset-tokens/?whitelisted=true')
+
+        self.assertEqual(unfiltered.status_code, 200)
+        self.assertEqual(
+            [row['asset_contract_address'] for row in unfiltered.json()['results']],
+            [ACCOUNT_ADDRESS],
+        )
+        self.assertEqual(whitelisted.status_code, 200)
+        self.assertEqual(whitelisted.json()['results'], [])
+
     def test_success_sync_unwhitelists_asset_token_on_remove(self):
         whitelisted_since = timezone.now() - timedelta(days=30)
         token = AssetToken.objects.create(
@@ -616,6 +717,496 @@ class AssetTokenAdminTests(TestCase):
         request = self._request(self._create_user(is_superuser=True))
         form_class = self.admin.get_form(request, obj=None)
         form = form_class(data={
-            'contract_address': 'CA3Q2KZ2F4V5XUQ6P7YJSVSV2Y2NF7QPAX5LQZ5Z5Z5Z5Z5Z5Z5Z5Z5Z5',
+            'contract_address': VALID_CONTRACT_ADDRESS,
         })
         self.assertTrue(form.is_valid(), msg=form.errors)
+
+    def test_add_form_rejects_valid_contract_address_that_differs_from_classic_pair(self):
+        request = self._request(self._create_user(is_superuser=True))
+        form_class = self.admin.get_form(request, obj=None)
+        form = form_class(data={
+            'classic_code': DEFAULT_CODE,
+            'classic_issuer': DEFAULT_ISSUER,
+            'contract_address': VALID_CONTRACT_ADDRESS,
+        })
+        self.assertFalse(form.is_valid())
+        self.assertEqual(
+            form.errors['contract_address'],
+            ['asset_contract_address does not match asset_code + asset_issuer.'],
+        )
+
+    def test_add_form_rejects_non_contract_address_on_contract_address_field(self):
+        request = self._request(self._create_user(is_superuser=True))
+        form_class = self.admin.get_form(request, obj=None)
+        for value in (ACCOUNT_ADDRESS, 'not-a-contract'):
+            with self.subTest(value=value):
+                form = form_class(data={'contract_address': value})
+                self.assertFalse(form.is_valid())
+                self.assertEqual(form.errors['contract_address'], [INVALID_CONTRACT_ADDRESS_ERROR])
+                self.assertNotIn('__all__', form.errors)
+
+    def test_add_form_reports_missing_identifiers_as_non_field_error(self):
+        request = self._request(self._create_user(is_superuser=True))
+        form_class = self.admin.get_form(request, obj=None)
+        form = form_class(data={})
+        self.assertFalse(form.is_valid())
+        self.assertEqual(
+            form.errors['__all__'],
+            ['Provide asset_code + asset_issuer, or asset_contract_address.'],
+        )
+        self.assertNotIn('contract_address', form.errors)
+
+
+class AssetTokenWrittenAfterPaymentTests(PromotionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.derived = Asset(DEFAULT_CODE, DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE)
+        self.next_hash_index = 2000
+
+    def _next_hash(self):
+        self.next_hash_index += 1
+        return distinct_hash(self.next_hash_index)
+
+    def _post(self, *, title='Asset proposal', **asset_identifiers):
+        identifiers = asset_identifiers or {'asset_code': DEFAULT_CODE, 'asset_issuer': DEFAULT_ISSUER}
+        payload = {
+            'proposed_by': DEFAULT_PROPOSED_BY,
+            'title': title,
+            'text': '<p>x</p>',
+            'transaction_hash': self._next_hash(),
+            'envelope_xdr': 'xdr',
+            'discord_username': 'user',
+            'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            **identifiers,
+            **asset_narratives(),
+        }
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
+            return self.client.post('/api/asset-proposal/', payload, format='json')
+
+    def _draft(self, **kwargs):
+        response = self._post(**kwargs)
+        self.assertEqual(response.status_code, 201, response.data)
+        return Proposal.objects.get(id=response.data['id'])
+
+    def _confirm_through_sweep(self, payment_status=Proposal.FINE):
+        with patch(VERIFY_PAYMENT, side_effect=verifies(payment_status)):
+            tasks.task_check_pending_proposal_payments()
+
+    def _confirm_through_endpoint(self, proposal, payment_status=Proposal.FINE):
+        with patch(VERIFY_PAYMENT, side_effect=verifies(payment_status)):
+            response = self.client.post(f'/api/proposal/{proposal.id}/check_payment/', {}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def _assert_unlinked_without_token(self, proposal):
+        proposal.refresh_from_db()
+        self.assertIsNone(proposal.asset_token_id)
+        self.assertFalse(AssetToken.objects.exists())
+
+    def _assert_linked_to_new_token(self, proposal):
+        proposal.refresh_from_db()
+        self.assertFalse(proposal.draft)
+        self.assertEqual(proposal.action, Proposal.NONE)
+        self.assertEqual(proposal.asset_token_id, self.derived)
+        token = AssetToken.objects.get()
+        self.assertEqual(token.contract_address, self.derived)
+        self.assertEqual(token.classic_code, DEFAULT_CODE)
+        self.assertEqual(token.classic_issuer, DEFAULT_ISSUER)
+
+    def _existing_whitelisted_token(self):
+        whitelisted_since = timezone.now() - timedelta(days=30)
+        AssetToken.objects.create(
+            contract_address=self.derived,
+            classic_code=DEFAULT_CODE,
+            classic_issuer=DEFAULT_ISSUER,
+            whitelisted=True,
+            whitelisted_since=whitelisted_since,
+        )
+        return whitelisted_since
+
+    def _assert_linked_to_existing_token(self, proposal, whitelisted_since):
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.asset_token_id, self.derived)
+        token = AssetToken.objects.get()
+        self.assertTrue(token.whitelisted)
+        self.assertEqual(token.whitelisted_since, whitelisted_since)
+
+    def _linked_proposal_with_token_snapshot(self, **overrides):
+        proposal = make_asset_proposal_raw(**overrides)
+        # A blank classic_code is what an upsert would backfill, so it exposes any write.
+        AssetToken.objects.filter(pk=proposal.asset_token_id).update(classic_code=None, whitelisted=True)
+        return proposal, AssetToken.objects.filter(pk=proposal.asset_token_id).values().get()
+
+    def _submit_window(self):
+        start_at = get_queue_week_start(timezone.now()) + timedelta(weeks=1)
+        return start_at, start_at + timedelta(days=7, seconds=-1)
+
+    def _rejected_and_rearmed(self, rearm_action, title='Asset proposal'):
+        proposal = self._draft(title=title)
+        self._confirm_through_endpoint(proposal, Proposal.INVALID_PAYMENT)
+        Proposal.objects.filter(id=proposal.id).update(
+            last_updated_at=timezone.now() - settings.DISCUSSION_TIME - timedelta(days=1),
+        )
+        call_command(
+            'rearm_proposal_payment_check', proposal.id,
+            action=rearm_action, unhide=True, stdout=StringIO(),
+        )
+        proposal.refresh_from_db()
+        self.assertFalse(proposal.draft)
+        self.assertFalse(proposal.hide)
+        return proposal
+
+    def _stage_submit(self, proposal):
+        start_at, end_at = self._submit_window()
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE), patch(
+            'aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch',
+        ):
+            response = self.client.post(
+                f'/api/proposal/{proposal.id}/submit/',
+                {
+                    'start_at': start_at.isoformat().replace('+00:00', 'Z'),
+                    'end_at': end_at.isoformat().replace('+00:00', 'Z'),
+                    'new_transaction_hash': self._next_hash(),
+                    'new_envelope_xdr': 'submit-xdr',
+                },
+                format='json',
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def _stage_update(self, proposal, title='Updated title'):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE), patch(
+            'aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch',
+        ):
+            response = self.client.put(
+                f'/api/proposal/{proposal.id}/',
+                {
+                    'new_title': title,
+                    'new_text': '<p>Updated text</p>',
+                    'new_envelope_xdr': 'update-xdr',
+                    'new_transaction_hash': self._next_hash(),
+                },
+                format='json',
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.action, Proposal.TO_UPDATE)
+
+    def _admin_request(self):
+        request = RequestFactory().post('/admin/')
+        request.user = get_user_model().objects.create_user(
+            username='payment_gate_admin', password='password', is_staff=True, is_superuser=True,
+        )
+        return request
+
+    def _admin_change_save(self, proposal):
+        request = self._admin_request()
+        proposal_admin = ProposalAdmin(Proposal, admin.site)
+        form_class = proposal_admin.get_form(request, obj=proposal, change=True)
+        form = form_class(
+            data={
+                'title': proposal.title,
+                'text': json.dumps({'delta': '', 'html': '<p>x</p>'}),
+                'discord_username': 'admin',
+                'hide': 'on' if proposal.hide else '',
+                **asset_narratives(),
+            },
+            instance=proposal,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        proposal_admin.save_model(request, form.save(commit=False), form, True)
+
+    def test_post_writes_no_token_for_classic_pair(self):
+        response = self._post()
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['asset_contract_address'], self.derived)
+        self.assertEqual(response.data['onchain_action_args'], [self.derived])
+        proposal = Proposal.objects.get(id=response.data['id'])
+        self.assertEqual(proposal.asset_contract_address, self.derived)
+        self._assert_unlinked_without_token(proposal)
+
+    def test_post_writes_no_token_for_contract_only_payload(self):
+        response = self._post(asset_contract_address=VALID_CONTRACT_ADDRESS)
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['asset_contract_address'], VALID_CONTRACT_ADDRESS)
+        proposal = Proposal.objects.get(id=response.data['id'])
+        self.assertEqual(proposal.asset_contract_address, VALID_CONTRACT_ADDRESS)
+        self.assertIsNone(proposal.asset_code)
+        self._assert_unlinked_without_token(proposal)
+
+    def test_sweep_confirmation_creates_and_links_token(self):
+        proposal = self._draft()
+
+        self._confirm_through_sweep()
+
+        self._assert_linked_to_new_token(proposal)
+
+    def test_check_payment_confirmation_creates_and_links_token(self):
+        proposal = self._draft()
+
+        self._confirm_through_endpoint(proposal)
+
+        self._assert_linked_to_new_token(proposal)
+
+    def test_sweep_confirmation_reuses_existing_token(self):
+        whitelisted_since = self._existing_whitelisted_token()
+        proposal = self._draft()
+
+        self._confirm_through_sweep()
+
+        self._assert_linked_to_existing_token(proposal, whitelisted_since)
+
+    def test_check_payment_confirmation_reuses_existing_token(self):
+        whitelisted_since = self._existing_whitelisted_token()
+        proposal = self._draft()
+
+        self._confirm_through_endpoint(proposal)
+
+        self._assert_linked_to_existing_token(proposal, whitelisted_since)
+
+    def test_rejected_payment_leaves_no_token_and_no_link(self):
+        proposal = self._draft()
+
+        self._confirm_through_endpoint(proposal, Proposal.INVALID_PAYMENT)
+
+        self._assert_unlinked_without_token(proposal)
+        self.assertTrue(proposal.hide)
+
+    def test_payment_never_found_leaves_no_token_and_no_link(self):
+        proposal = self._draft()
+
+        self._confirm_through_sweep(Proposal.HORIZON_ERROR)
+        self._assert_unlinked_without_token(proposal)
+        self.assertTrue(proposal.draft)
+
+        Proposal.objects.filter(id=proposal.id).update(
+            payment_not_found_since=timezone.now() - settings.PROPOSAL_PAYMENT_NOT_FOUND_TIMEOUT - timedelta(minutes=1),
+        )
+        self._confirm_through_sweep()
+        self._assert_unlinked_without_token(proposal)
+        self.assertTrue(proposal.draft)
+
+    def test_reused_payment_hash_rolls_the_token_back(self):
+        proposal = self._draft()
+        ConsumedTransaction.objects.create(
+            transaction_hash=proposal.transaction_hash,
+            purpose=ConsumedTransaction.PURPOSE_LEGACY,
+        )
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'transaction_already_consumed')
+        self._assert_unlinked_without_token(proposal)
+
+    def test_confirmation_of_already_linked_draft_leaves_token_untouched(self):
+        proposal, snapshot = self._linked_proposal_with_token_snapshot(
+            draft=True,
+            action=Proposal.TO_CREATE,
+            transaction_hash=self._next_hash(),
+        )
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'created')
+        proposal.refresh_from_db()
+        self.assertFalse(proposal.draft)
+        self.assertEqual(proposal.action, Proposal.NONE)
+        self.assertEqual(proposal.asset_token_id, snapshot['contract_address'])
+        self.assertEqual(AssetToken.objects.values().get(), snapshot)
+
+    def test_rejected_create_leaves_token_list_empty(self):
+        proposal = self._draft()
+
+        self._confirm_through_endpoint(proposal, Proposal.INVALID_PAYMENT)
+
+        body = self.client.get('/api/asset-tokens/').json()
+        self.assertEqual(body['count'], 0)
+        self.assertEqual(body['results'], [])
+
+    def test_whitelisted_token_with_only_a_hidden_proposal_stays_listed(self):
+        proposal = make_asset_proposal_raw(hide=True, transaction_hash=self._next_hash())
+        AssetToken.objects.filter(pk=proposal.asset_token_id).update(whitelisted=True)
+
+        body = self.client.get('/api/asset-tokens/').json()
+
+        self.assertEqual(body['count'], 1)
+        self.assertEqual(body['results'][0]['asset_contract_address'], proposal.asset_token_id)
+        self.assertEqual(body['results'][0]['proposals'], [])
+
+    def test_admin_edit_of_unpaid_draft_writes_no_token(self):
+        proposal = self._draft()
+
+        self._admin_change_save(proposal)
+
+        self._assert_unlinked_without_token(proposal)
+
+    def test_admin_edit_of_rejected_row_writes_no_token(self):
+        proposal = self._draft()
+        self._confirm_through_endpoint(proposal, Proposal.INVALID_PAYMENT)
+        proposal.refresh_from_db()
+        self.assertFalse(proposal.draft)
+        self.assertEqual(proposal.payment_status, Proposal.INVALID_PAYMENT)
+
+        self._admin_change_save(proposal)
+
+        self._assert_unlinked_without_token(proposal)
+        self.assertEqual(self.client.get('/api/asset-tokens/').json()['count'], 0)
+
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_admin_add_links_token(self, _mock_lock):
+        request = self._admin_request()
+        proposal_admin = ProposalAdmin(Proposal, admin.site)
+        form = proposal_admin.get_form(request)(data={
+            'proposed_by': DEFAULT_PROPOSED_BY,
+            'title': 'Admin asset proposal',
+            'text': json.dumps({'delta': '', 'html': '<p>x</p>'}),
+            'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            'discord_username': 'admin',
+            'asset_code': DEFAULT_CODE,
+            'asset_issuer': DEFAULT_ISSUER,
+            **asset_narratives(),
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+        proposal = form.save(commit=False)
+
+        proposal_admin.save_model(request, proposal, form, False)
+
+        self._assert_linked_to_new_token(proposal)
+
+    def _assert_rearmed_row_links_on_fine_submit_confirmation(self, rearm_action):
+        proposal = self._rejected_and_rearmed(rearm_action)
+        self._assert_unlinked_without_token(proposal)
+
+        self._stage_submit(proposal)
+        self._assert_unlinked_without_token(proposal)
+
+        self._confirm_through_endpoint(proposal)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.proposal_status, Proposal.QUEUED)
+        self.assertEqual(proposal.asset_token_id, self.derived)
+        self.assertEqual(AssetToken.objects.get().contract_address, self.derived)
+
+    def test_row_rearmed_to_create_links_on_fine_submit_confirmation(self):
+        self._assert_rearmed_row_links_on_fine_submit_confirmation(Proposal.TO_CREATE)
+
+    def test_row_rearmed_to_none_links_on_fine_submit_confirmation(self):
+        self._assert_rearmed_row_links_on_fine_submit_confirmation(Proposal.NONE)
+
+    def test_submit_confirmation_that_is_not_fine_leaves_rearmed_row_unlinked(self):
+        for index, status in enumerate((Proposal.INVALID_PAYMENT, Proposal.HORIZON_ERROR)):
+            with self.subTest(status=status):
+                proposal = self._rejected_and_rearmed(Proposal.NONE, title=f'Unpaid submit {index}')
+                self._stage_submit(proposal)
+
+                self._confirm_through_endpoint(proposal, status)
+
+                self._assert_unlinked_without_token(proposal)
+                self.assertEqual(proposal.proposal_status, Proposal.DISCUSSION)
+
+    def test_submit_confirmation_of_linked_proposal_leaves_token_untouched(self):
+        start_at, end_at = self._submit_window()
+        proposal, snapshot = self._linked_proposal_with_token_snapshot(
+            action=Proposal.TO_SUBMIT,
+            transaction_hash=self._next_hash(),
+            new_transaction_hash=self._next_hash(),
+            new_envelope_xdr='submit-xdr',
+            new_start_at=start_at,
+            new_end_at=end_at,
+        )
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'booked')
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.asset_token_id, snapshot['contract_address'])
+        self.assertEqual(AssetToken.objects.values().get(), snapshot)
+
+    def _assert_rearmed_row_links_on_paid_update(self, rearm_action):
+        proposal = self._rejected_and_rearmed(rearm_action)
+        self._stage_update(proposal)
+        self._assert_unlinked_without_token(proposal)
+
+        self._confirm_through_endpoint(proposal)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.action, Proposal.NONE)
+        self.assertEqual(proposal.title, 'Updated title')
+        self.assertEqual(proposal.asset_token_id, self.derived)
+        self.assertEqual(AssetToken.objects.get().contract_address, self.derived)
+
+    def test_row_rearmed_to_none_links_on_paid_update(self):
+        self._assert_rearmed_row_links_on_paid_update(Proposal.NONE)
+
+    def test_row_rearmed_to_update_links_on_paid_update(self):
+        self._assert_rearmed_row_links_on_paid_update(Proposal.TO_UPDATE)
+
+    def test_update_verdict_that_is_not_fine_leaves_rearmed_row_unlinked(self):
+        scenarios = [
+            (rearm_action, status)
+            for rearm_action in (Proposal.NONE, Proposal.TO_UPDATE)
+            for status in (Proposal.INVALID_PAYMENT, Proposal.HORIZON_ERROR)
+        ]
+        for index, (rearm_action, status) in enumerate(scenarios):
+            with self.subTest(rearm_action=rearm_action, status=status):
+                proposal = self._rejected_and_rearmed(rearm_action, title=f'Unpaid update {index}')
+                self._stage_update(proposal)
+
+                self._confirm_through_endpoint(proposal, status)
+
+                self._assert_unlinked_without_token(proposal)
+
+    def test_reused_hash_on_update_rolls_the_token_back(self):
+        proposal = self._rejected_and_rearmed(Proposal.NONE)
+        self._stage_update(proposal)
+        ConsumedTransaction.objects.create(
+            transaction_hash=proposal.new_transaction_hash,
+            purpose=ConsumedTransaction.PURPOSE_LEGACY,
+        )
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'transaction_already_consumed')
+        self._assert_unlinked_without_token(proposal)
+
+    def test_update_confirmation_of_linked_proposal_leaves_token_untouched(self):
+        proposal, snapshot = self._linked_proposal_with_token_snapshot(
+            action=Proposal.TO_UPDATE,
+            transaction_hash=self._next_hash(),
+            new_title='Updated title',
+            new_text=quill('<p>Updated text</p>'),
+            new_transaction_hash=self._next_hash(),
+            new_envelope_xdr='update-xdr',
+        )
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'updated')
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.asset_token_id, snapshot['contract_address'])
+        self.assertEqual(AssetToken.objects.values().get(), snapshot)
+
+    @patch('aqua_governance.governance.proposal_transactions.validate_weekly_queue_slot')
+    def test_expired_submit_confirmation_links_rearmed_row(self, _mock_validate_slot):
+        proposal = self._rejected_and_rearmed(Proposal.NONE)
+        self._stage_submit(proposal)
+        start_at = get_queue_week_start(timezone.now()) - timedelta(weeks=1)
+        Proposal.objects.filter(id=proposal.id).update(
+            new_start_at=start_at,
+            new_end_at=start_at + timedelta(days=7, seconds=-1),
+        )
+        proposal.refresh_from_db()
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'expired')
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.proposal_status, Proposal.EXPIRED)
+        self.assertEqual(proposal.asset_token_id, self.derived)
+        self.assertEqual(AssetToken.objects.get().contract_address, self.derived)

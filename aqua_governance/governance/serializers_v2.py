@@ -6,9 +6,10 @@ from rest_framework.validators import UniqueValidator
 
 from aqua_governance.governance.asset_payload import validate_asset_payload
 from aqua_governance.governance.asset_tokens import (
+    derive_asset_contract_address,
     find_active_asset_proposal_conflict,
+    normalize_asset_value,
     serialize_asset_proposal_conflict,
-    upsert_asset_token_from_proposal,
 )
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
 from aqua_governance.governance.exceptions import AssetProposalConflictError, ASSET_PROPOSAL_CONFLICT_DETAIL
@@ -570,11 +571,15 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
         )
         validated_data["payment_status"] = status
 
-        with transaction.atomic():
-            proposal = super().create(validated_data)
-            upsert_asset_token_from_proposal(proposal, save=True)
+        # Set before the insert: the address is immutable once the row exists.
+        if not normalize_asset_value(validated_data.get("asset_contract_address")):
+            validated_data["asset_contract_address"] = derive_asset_contract_address(
+                asset_code=validated_data.get("asset_code"),
+                asset_issuer=validated_data.get("asset_issuer"),
+                asset_contract_address=None,
+            )
 
-        return proposal
+        return super().create(validated_data)
 
 
 # ---------------------------------------------------------------------------

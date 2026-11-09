@@ -10,6 +10,7 @@ from aqua_governance.governance.tests._factories import (
     DEFAULT_CODE,
     DEFAULT_ISSUER,
     make_asset_proposal,
+    patch_ice_circulating_supply,
 )
 
 
@@ -146,3 +147,46 @@ class AssetTokensApiContractTests(TestCase):
         body = response.json()
         self.assertEqual(body['count'], 0)
         self.assertEqual(body['results'], [])
+
+
+class AssetTokensWhitelistedFilterTests(TestCase):
+    def setUp(self):
+        ice_supply_patcher = patch_ice_circulating_supply()
+        ice_supply_patcher.start()
+        self.addCleanup(ice_supply_patcher.stop)
+        self.client = APIClient()
+
+        make_asset_proposal(title='Whitelisted token', asset_code=DEFAULT_CODE)
+        make_asset_proposal(title='Other token', asset_code='OTHER')
+        self.whitelisted = Asset(DEFAULT_CODE, DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE)
+        self.not_whitelisted = Asset('OTHER', DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE)
+        AssetToken.objects.filter(contract_address=self.whitelisted).update(whitelisted=True)
+
+    def _assert_listed(self, query_string, expected_addresses):
+        response = self.client.get(f'/api/asset-tokens/{query_string}')
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['count'], len(expected_addresses))
+        self.assertCountEqual(
+            [row['asset_contract_address'] for row in body['results']],
+            expected_addresses,
+        )
+
+    def test_true_returns_only_whitelisted_tokens(self):
+        self._assert_listed('?whitelisted=true', [self.whitelisted])
+
+    def test_false_returns_only_non_whitelisted_tokens(self):
+        self._assert_listed('?whitelisted=false', [self.not_whitelisted])
+
+    def test_value_is_case_insensitive_and_trimmed(self):
+        self._assert_listed('?whitelisted=TRUE', [self.whitelisted])
+        self._assert_listed('?whitelisted=%20False%20', [self.not_whitelisted])
+
+    def test_missing_parameter_returns_every_token(self):
+        self._assert_listed('', [self.whitelisted, self.not_whitelisted])
+
+    def test_unknown_value_returns_every_token(self):
+        for value in ('maybe', '1', ''):
+            with self.subTest(value=value):
+                self._assert_listed(f'?whitelisted={value}', [self.whitelisted, self.not_whitelisted])

@@ -431,7 +431,7 @@ task_check_pending_proposal_payments  [every minute]
 | `api/proposal/` | ProposalViewSet | v2 current | Full CRUD + submit + check_payment; excludes `id=65` |
 | `api/votes-for-proposal/` | LogVoteView | both | Vote listing only |
 | `api/asset-proposal/` | AssetProposalViewSet | v2 | Asset-governance proposals (`ADD_ASSET` / `REMOVE_ASSET`) |
-| `api/asset-tokens/` | AssetTokenView | v2 | On-chain asset-token registry |
+| `api/asset-tokens/` | AssetTokenView | v2 | On-chain asset-token registry; optional `whitelisted=true\|false` filter |
 | `api/proposal-queue/` | ProposalQueueViewSet | v2 | Weekly voting-slot booking / queue state |
 | `open/cms/` | Django Admin | — | Staff interface |
 
@@ -550,7 +550,7 @@ Both are PostgreSQL advisory locks and both must stay distinct.
 
 4. **Legacy v1 date cutoff**: `ProposalsView` (v1) hardcodes `created_at__lte=datetime(2022, 4, 15)`. Any proposal created after this date is invisible via the v1 API.
 
-5. **`Proposal.save()` makes an outbound HTTP call on insert**: it fetches `ICE_CIRCULATING_URL` with **no timeout**, and `AssetProposalCreateSerializer.create` runs that save inside `transaction.atomic()`. One hung request therefore holds a write transaction open. Every test that creates a `Proposal` must wrap it in `_factories.patch_ice_circulating_supply()`.
+5. **`Proposal.save()` makes an outbound HTTP call on insert**: it fetches `ICE_CIRCULATING_URL` with **no timeout**, so one hung request hangs the API call that made it. Every test that creates a `Proposal` must wrap it in `_factories.patch_ice_circulating_supply()`.
 
 6. **Staged `new_*` update pattern**: Updates/submits do not apply immediately. Fields are staged in `new_title`, `new_text`, `new_transaction_hash`, `new_envelope_xdr`, `new_start_at`, `new_end_at`, with `action` set. `check_transaction()` promotes them later (beat sweep or `/check_payment/`) — and promotes the transition it *verified*, never the staged columns re-read after the fact, since staging is unauthenticated and can change in between.
 
