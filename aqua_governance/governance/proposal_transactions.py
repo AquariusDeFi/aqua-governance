@@ -455,6 +455,7 @@ def _apply_update_confirmation(proposal, transition, status):
     # because the descriptor re-wraps it on the way out; clear the column explicitly so
     # operational queries can still use ``new_text IS NULL``.
     type(proposal).objects.filter(pk=proposal.pk).update(new_text=None)
+    _link_asset_token_after_payment(proposal)
 
 
 def _check_submit_transaction(proposal):

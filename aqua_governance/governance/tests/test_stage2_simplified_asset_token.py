@@ -31,7 +31,7 @@ from aqua_governance.governance.tests._factories import (
     make_asset_proposal_raw,
     patch_ice_circulating_supply,
 )
-from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, PromotionTestCase, verifies
+from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, PromotionTestCase, quill, verifies
 
 
 DEFAULT_PROPOSED_BY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'
@@ -872,6 +872,24 @@ class AssetTokenWrittenAfterPaymentTests(PromotionTestCase):
             )
         self.assertEqual(response.status_code, 200, response.data)
 
+    def _stage_update(self, proposal, title='Updated title'):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE), patch(
+            'aqua_governance.governance.views.ProposalViewSet._reject_declared_owner_mismatch',
+        ):
+            response = self.client.put(
+                f'/api/proposal/{proposal.id}/',
+                {
+                    'new_title': title,
+                    'new_text': '<p>Updated text</p>',
+                    'new_envelope_xdr': 'update-xdr',
+                    'new_transaction_hash': self._next_hash(),
+                },
+                format='json',
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.action, Proposal.TO_UPDATE)
+
     def _admin_request(self):
         request = RequestFactory().post('/admin/')
         request.user = get_user_model().objects.create_user(
@@ -1106,3 +1124,89 @@ class AssetTokenWrittenAfterPaymentTests(PromotionTestCase):
         proposal.refresh_from_db()
         self.assertEqual(proposal.asset_token_id, snapshot['contract_address'])
         self.assertEqual(AssetToken.objects.values().get(), snapshot)
+
+    def _assert_rearmed_row_links_on_paid_update(self, rearm_action):
+        proposal = self._rejected_and_rearmed(rearm_action)
+        self._stage_update(proposal)
+        self._assert_unlinked_without_token(proposal)
+
+        self._confirm_through_endpoint(proposal)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.action, Proposal.NONE)
+        self.assertEqual(proposal.title, 'Updated title')
+        self.assertEqual(proposal.asset_token_id, self.derived)
+        self.assertEqual(AssetToken.objects.get().contract_address, self.derived)
+
+    def test_row_rearmed_to_none_links_on_paid_update(self):
+        self._assert_rearmed_row_links_on_paid_update(Proposal.NONE)
+
+    def test_row_rearmed_to_update_links_on_paid_update(self):
+        self._assert_rearmed_row_links_on_paid_update(Proposal.TO_UPDATE)
+
+    def test_update_verdict_that_is_not_fine_leaves_rearmed_row_unlinked(self):
+        scenarios = [
+            (rearm_action, status)
+            for rearm_action in (Proposal.NONE, Proposal.TO_UPDATE)
+            for status in (Proposal.INVALID_PAYMENT, Proposal.HORIZON_ERROR)
+        ]
+        for index, (rearm_action, status) in enumerate(scenarios):
+            with self.subTest(rearm_action=rearm_action, status=status):
+                proposal = self._rejected_and_rearmed(rearm_action, title=f'Unpaid update {index}')
+                self._stage_update(proposal)
+
+                self._confirm_through_endpoint(proposal, status)
+
+                self._assert_unlinked_without_token(proposal)
+
+    def test_reused_hash_on_update_rolls_the_token_back(self):
+        proposal = self._rejected_and_rearmed(Proposal.NONE)
+        self._stage_update(proposal)
+        ConsumedTransaction.objects.create(
+            transaction_hash=proposal.new_transaction_hash,
+            purpose=ConsumedTransaction.PURPOSE_LEGACY,
+        )
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'transaction_already_consumed')
+        self._assert_unlinked_without_token(proposal)
+
+    def test_update_confirmation_of_linked_proposal_leaves_token_untouched(self):
+        proposal, snapshot = self._linked_proposal_with_token_snapshot(
+            action=Proposal.TO_UPDATE,
+            transaction_hash=self._next_hash(),
+            new_title='Updated title',
+            new_text=quill('<p>Updated text</p>'),
+            new_transaction_hash=self._next_hash(),
+            new_envelope_xdr='update-xdr',
+        )
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'updated')
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.asset_token_id, snapshot['contract_address'])
+        self.assertEqual(AssetToken.objects.values().get(), snapshot)
+
+    @patch('aqua_governance.governance.proposal_transactions.validate_weekly_queue_slot')
+    def test_expired_submit_confirmation_links_rearmed_row(self, _mock_validate_slot):
+        proposal = self._rejected_and_rearmed(Proposal.NONE)
+        self._stage_submit(proposal)
+        start_at = get_queue_week_start(timezone.now()) - timedelta(weeks=1)
+        Proposal.objects.filter(id=proposal.id).update(
+            new_start_at=start_at,
+            new_end_at=start_at + timedelta(days=7, seconds=-1),
+        )
+        proposal.refresh_from_db()
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(proposal)
+
+        self.assertEqual(result['outcome'], 'expired')
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.proposal_status, Proposal.EXPIRED)
+        self.assertEqual(proposal.asset_token_id, self.derived)
+        self.assertEqual(AssetToken.objects.get().contract_address, self.derived)
