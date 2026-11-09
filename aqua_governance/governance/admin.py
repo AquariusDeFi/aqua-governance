@@ -365,7 +365,7 @@ class AssetTokenAdmin(admin.ModelAdmin):
                                 'classic_code': message,
                                 'classic_issuer': message,
                             })
-                        if 'does not match' in message:
+                        if 'does not match' in message or 'valid Soroban contract address' in message:
                             raise ValidationError({'contract_address': message})
                         raise ValidationError(message)
                     return cleaned_data

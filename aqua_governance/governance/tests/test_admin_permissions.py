@@ -18,6 +18,7 @@ from aqua_governance.governance.proposal_queue import get_queue_week_start
 from aqua_governance.governance.tests._factories import (
     DEFAULT_PROPOSED_BY,
     SECONDARY_ACCOUNT,
+    asset_narratives,
     make_asset_proposal,
     make_asset_proposal_raw,
     patch_ice_circulating_supply,
@@ -127,6 +128,33 @@ class ProposalAdminPermissionTests(TestCase):
 
         self.assertFalse(form.is_valid())
         self.assertIn('proposal_type', form.errors)
+
+    @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
+    def test_asset_proposal_form_rejects_account_address_as_contract_address(self, mock_lock):
+        request = self.factory.post('/admin/')
+        request.user = self._create_user(with_manage_perm=True)
+
+        form_class = self.admin.get_form(request)
+        with patch_ice_circulating_supply():
+            form = form_class(data={
+                'proposed_by': DEFAULT_PROPOSED_BY,
+                'title': 'Asset proposal',
+                'text': self._quill_form_value(),
+                'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+                'proposal_status': Proposal.DISCUSSION,
+                'discord_username': 'manager',
+                'asset_contract_address': 'GCZ3PVJTKLUB724VUS2ZZZCG3NAYBS75BMBJ6RG3OLPXKC23ISKWLZTI',
+                **asset_narratives(),
+            })
+
+            self.assertFalse(form.is_valid())
+
+        self.assertEqual(
+            form.errors['asset_contract_address'],
+            ['asset_contract_address must be a valid Soroban contract address.'],
+        )
+        self.assertNotIn('asset_code', form.errors)
+        self.assertNotIn('asset_issuer', form.errors)
 
     @patch('aqua_governance.governance.forms.acquire_proposal_transition_lock')
     def test_manager_can_create_asset_proposal_without_payment_xdr(self, mock_lock):

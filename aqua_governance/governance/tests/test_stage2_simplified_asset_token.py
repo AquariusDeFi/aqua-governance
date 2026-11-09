@@ -7,6 +7,7 @@ from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser, Permission
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.test import RequestFactory, TestCase
 from django.utils import timezone
 from django_quill.quill import Quill
@@ -26,6 +27,9 @@ from aqua_governance.governance.tests._factories import asset_narratives, patch_
 DEFAULT_PROPOSED_BY = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'
 DEFAULT_CODE = 'AQUA'
 DEFAULT_ISSUER = 'GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA'
+VALID_CONTRACT_ADDRESS = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM'
+ACCOUNT_ADDRESS = 'GCZ3PVJTKLUB724VUS2ZZZCG3NAYBS75BMBJ6RG3OLPXKC23ISKWLZTI'
+INVALID_CONTRACT_ADDRESS_ERROR = 'asset_contract_address must be a valid Soroban contract address.'
 
 
 def quill_text(html='<p>x</p>'):
@@ -388,6 +392,93 @@ class SimplifiedAssetTokenTests(TestCase):
         # contains that substring, so the mismatch surfaces on asset_issuer.
         self.assertIn('asset_issuer', response.data)
 
+    def _post_contract_only_asset_proposal(self, asset_contract_address, transaction_hash):
+        payload = {
+            'proposed_by': DEFAULT_PROPOSED_BY,
+            'title': 'Asset proposal',
+            'text': '<p>x</p>',
+            'transaction_hash': transaction_hash,
+            'envelope_xdr': 'xdr',
+            'discord_username': 'user',
+            'proposal_type': Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            'asset_contract_address': asset_contract_address,
+            **asset_narratives(),
+        }
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
+            return APIClient().post('/api/asset-proposal/', payload, format='json')
+
+    def test_asset_create_rejects_account_address_as_contract_address(self):
+        response = self._post_contract_only_asset_proposal(ACCOUNT_ADDRESS, 'c' * 64)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            [str(error) for error in response.data['asset_contract_address']],
+            [INVALID_CONTRACT_ADDRESS_ERROR],
+        )
+        self.assertFalse(Proposal.objects.exists())
+        self.assertFalse(AssetToken.objects.exists())
+
+    def test_asset_create_accepts_contract_address_without_classic_pair(self):
+        response = self._post_contract_only_asset_proposal(VALID_CONTRACT_ADDRESS, 'd' * 64)
+
+        self.assertEqual(response.status_code, 201)
+        proposal = Proposal.objects.get(id=response.data['id'])
+        self.assertEqual(proposal.asset_contract_address, VALID_CONTRACT_ADDRESS)
+        self.assertEqual(proposal.asset_token_id, VALID_CONTRACT_ADDRESS)
+        self.assertTrue(AssetToken.objects.filter(contract_address=VALID_CONTRACT_ADDRESS).exists())
+
+    def _create_proposal_linked_to_account_address_token(self):
+        token = AssetToken.objects.create(contract_address=ACCOUNT_ADDRESS)
+        return create_proposal(
+            proposal_type=Proposal.PROPOSAL_TYPE_ADD_ASSET,
+            asset_contract_address=ACCOUNT_ADDRESS,
+            asset_token=token,
+            **asset_narratives(),
+        )
+
+    def test_clean_reports_stored_account_address_as_validation_error(self):
+        proposal = self._create_proposal_linked_to_account_address_token()
+
+        with self.assertRaises(ValidationError) as context:
+            proposal.clean()
+
+        self.assertEqual(context.exception.messages, [INVALID_CONTRACT_ADDRESS_ERROR])
+
+    def test_admin_change_form_reports_stored_account_address_as_form_error(self):
+        proposal = self._create_proposal_linked_to_account_address_token()
+        request = RequestFactory().post('/admin/')
+        request.user = get_user_model().objects.create_user(
+            username='change_form_admin', password='password', is_staff=True, is_superuser=True,
+        )
+        form_class = ProposalAdmin(Proposal, admin.site).get_form(request, obj=proposal, change=True)
+        form = form_class(
+            data={
+                'title': proposal.title,
+                'text': json.dumps({'delta': '', 'html': '<p>x</p>'}),
+                'discord_username': 'admin',
+                **asset_narratives(),
+            },
+            instance=proposal,
+        )
+
+        self.assertNotIn('asset_contract_address', form.fields)
+        self.assertFalse(form.is_valid())
+        self.assertIn(INVALID_CONTRACT_ADDRESS_ERROR, form.non_field_errors())
+
+    def test_asset_tokens_list_keeps_stored_account_address_row(self):
+        self._create_proposal_linked_to_account_address_token()
+
+        unfiltered = APIClient().get('/api/asset-tokens/')
+        whitelisted = APIClient().get('/api/asset-tokens/?whitelisted=true')
+
+        self.assertEqual(unfiltered.status_code, 200)
+        self.assertEqual(
+            [row['asset_contract_address'] for row in unfiltered.json()['results']],
+            [ACCOUNT_ADDRESS],
+        )
+        self.assertEqual(whitelisted.status_code, 200)
+        self.assertEqual(whitelisted.json()['results'], [])
+
     def test_success_sync_unwhitelists_asset_token_on_remove(self):
         whitelisted_since = timezone.now() - timedelta(days=30)
         token = AssetToken.objects.create(
@@ -616,6 +707,41 @@ class AssetTokenAdminTests(TestCase):
         request = self._request(self._create_user(is_superuser=True))
         form_class = self.admin.get_form(request, obj=None)
         form = form_class(data={
-            'contract_address': 'CA3Q2KZ2F4V5XUQ6P7YJSVSV2Y2NF7QPAX5LQZ5Z5Z5Z5Z5Z5Z5Z5Z5Z5',
+            'contract_address': VALID_CONTRACT_ADDRESS,
         })
         self.assertTrue(form.is_valid(), msg=form.errors)
+
+    def test_add_form_rejects_valid_contract_address_that_differs_from_classic_pair(self):
+        request = self._request(self._create_user(is_superuser=True))
+        form_class = self.admin.get_form(request, obj=None)
+        form = form_class(data={
+            'classic_code': DEFAULT_CODE,
+            'classic_issuer': DEFAULT_ISSUER,
+            'contract_address': VALID_CONTRACT_ADDRESS,
+        })
+        self.assertFalse(form.is_valid())
+        self.assertEqual(
+            form.errors['contract_address'],
+            ['asset_contract_address does not match asset_code + asset_issuer.'],
+        )
+
+    def test_add_form_rejects_non_contract_address_on_contract_address_field(self):
+        request = self._request(self._create_user(is_superuser=True))
+        form_class = self.admin.get_form(request, obj=None)
+        for value in (ACCOUNT_ADDRESS, 'not-a-contract'):
+            with self.subTest(value=value):
+                form = form_class(data={'contract_address': value})
+                self.assertFalse(form.is_valid())
+                self.assertEqual(form.errors['contract_address'], [INVALID_CONTRACT_ADDRESS_ERROR])
+                self.assertNotIn('__all__', form.errors)
+
+    def test_add_form_reports_missing_identifiers_as_non_field_error(self):
+        request = self._request(self._create_user(is_superuser=True))
+        form_class = self.admin.get_form(request, obj=None)
+        form = form_class(data={})
+        self.assertFalse(form.is_valid())
+        self.assertEqual(
+            form.errors['__all__'],
+            ['Provide asset_code + asset_issuer, or asset_contract_address.'],
+        )
+        self.assertNotIn('contract_address', form.errors)
