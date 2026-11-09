@@ -36,6 +36,7 @@ from aqua_governance.governance import payment_statuses
 from aqua_governance.governance.asset_tokens import (
     find_active_asset_proposal_conflict,
     serialize_asset_proposal_conflict,
+    upsert_asset_token_from_proposal,
 )
 from aqua_governance.governance.consumed_transactions import claim_transaction_hashes
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
@@ -176,6 +177,16 @@ def _claim(proposal, transition, result, purpose):
         purpose=purpose,
         payer=result.payer,
     )
+
+
+def _link_asset_token_after_payment(proposal):
+    """Write the asset token of a proposal whose payment has just been verified.
+
+    Runs before the claim, in the transaction that applies the transition, so a rejected
+    claim rolls the token back too.  A proposal that already has a link is left alone.
+    """
+    if proposal.is_asset_proposal and not proposal.asset_token_id:
+        upsert_asset_token_from_proposal(proposal, save=True)
 
 
 def _quill_from_html(text_html):
@@ -691,6 +702,7 @@ def _apply_asset_create_transaction(proposal, transition, result):
             locked_proposal.payment_status = status
             locked_proposal.save()
             if status == proposal.FINE:
+                _link_asset_token_after_payment(locked_proposal)
                 _claim(locked_proposal, transition, result, CONSUMED_TRANSACTION_PURPOSE_CREATE)
     except TransactionAlreadyConsumedError as exc:
         outcome = _handle_transaction_reuse(proposal, proposal.TO_CREATE, transition, exc)
@@ -746,6 +758,7 @@ def _apply_submit_confirmation(
     proposal.new_envelope_xdr = None
     proposal.new_transaction_hash = None
     proposal.save()
+    _link_asset_token_after_payment(proposal)
     if create_queue_slot:
         sync_proposal_queue_slot(proposal)
 
