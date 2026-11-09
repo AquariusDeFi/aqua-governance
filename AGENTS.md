@@ -431,7 +431,7 @@ task_check_pending_proposal_payments  [every minute]
 | `api/proposal/` | ProposalViewSet | v2 current | Full CRUD + submit + check_payment; excludes `id=65` |
 | `api/votes-for-proposal/` | LogVoteView | both | Vote listing only |
 | `api/asset-proposal/` | AssetProposalViewSet | v2 | Asset-governance proposals (`ADD_ASSET` / `REMOVE_ASSET`) |
-| `api/asset-tokens/` | AssetTokenView | v2 | On-chain asset-token registry |
+| `api/asset-tokens/` | AssetTokenView | v2 | On-chain asset-token registry; optional `whitelisted=true\|false` filter |
 | `api/proposal-queue/` | ProposalQueueViewSet | v2 | Weekly voting-slot booking / queue state |
 | `open/cms/` | Django Admin | — | Staff interface |
 
