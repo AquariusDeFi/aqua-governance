@@ -26,6 +26,7 @@ EXPECTED_PROPOSAL_KEYS = {
     'id', 'proposal_type', 'proposal_status', 'payment_verification_status', 'title',
     'start_at', 'end_at', 'new_start_at', 'new_end_at',
     'vote_for_result', 'vote_against_result', 'vote_abstain_result',
+    'percent_for_quorum', 'ice_circulating_supply', 'aqua_circulating_supply', 'separate_side_quorum',
     'onchain_execution_status', 'onchain_execution_tx_hash',
     'created_at', 'last_updated_at',
 }

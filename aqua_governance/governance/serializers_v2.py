@@ -232,6 +232,7 @@ class ProposalListSerializer(serializers.ModelSerializer):
             "logvote_set",
             "percent_for_quorum",
             "ice_circulating_supply",
+            "separate_side_quorum",
             "vote_for_issuer",
             "vote_against_issuer",
             "abstain_issuer",
@@ -258,6 +259,9 @@ class ProposalListSerializer(serializers.ModelSerializer):
             "asset_community_references",
             "asset_aquarius_traction",
             "asset_issuer_commitments",
+        ]
+        read_only_fields = [
+            "separate_side_quorum",
         ]
 
     def get_payment_verification_status(self, obj):
@@ -296,6 +300,7 @@ class ProposalDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "percent_for_quorum",
             "ice_circulating_supply",
+            "separate_side_quorum",
             "abstain_issuer",
             "vote_abstain_result",
             "proposal_type",
@@ -320,6 +325,9 @@ class ProposalDetailSerializer(serializers.ModelSerializer):
             "asset_community_references",
             "asset_aquarius_traction",
             "asset_issuer_commitments",
+        ]
+        read_only_fields = [
+            "separate_side_quorum",
         ]
 
     def get_payment_verification_status(self, obj):
@@ -874,10 +882,20 @@ class AssetTokenProposalSerializer(serializers.ModelSerializer):
             "vote_for_result",
             "vote_against_result",
             "vote_abstain_result",
+            "percent_for_quorum",
+            "ice_circulating_supply",
+            "aqua_circulating_supply",
+            "separate_side_quorum",
             "onchain_execution_status",
             "onchain_execution_tx_hash",
             "created_at",
             "last_updated_at",
+        ]
+        read_only_fields = [
+            "percent_for_quorum",
+            "ice_circulating_supply",
+            "aqua_circulating_supply",
+            "separate_side_quorum",
         ]
 
     def get_payment_verification_status(self, obj):

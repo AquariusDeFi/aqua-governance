@@ -297,6 +297,7 @@ Phase 4 — Bulk DB operations:
 | aqua_circulating_supply | DecimalField | AQUA supply snapshot at last update |
 | ice_circulating_supply | DecimalField | ICE supply snapshot at last update |
 | percent_for_quorum | PositiveSmallIntegerField | Default 20 (= 20% quorum required) |
+| separate_side_quorum | BooleanField | Default True: side quorum, For+Abstain for For and Against+Abstain for Against (`proposal_outcome.py`). False: pooled For+Against+Abstain quorum, set by migration 0033 on proposals whose voting had ended when it ran. Read-only in the API and admin |
 | hide | BooleanField | Soft delete (excluded from all public endpoints) |
 | draft | BooleanField | True until creation payment verified |
 | is_simple_proposal | BooleanField | Reserved for future custom voting options |

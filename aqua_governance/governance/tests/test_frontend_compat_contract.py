@@ -27,7 +27,12 @@ from aqua_governance.governance.tests._chain import (
     OnChainTestCase,
     utc_second_iso,
 )
-from aqua_governance.governance.tests._factories import DEFAULT_CODE, DEFAULT_ISSUER, asset_narratives
+from aqua_governance.governance.tests._factories import (
+    DEFAULT_CODE,
+    DEFAULT_ISSUER,
+    asset_narratives,
+    make_general_proposal,
+)
 from aqua_governance.governance.tests._promotions import VERIFY_PAYMENT, fine
 from aqua_governance.utils.memo import legacy_memo_digest
 
@@ -95,7 +100,7 @@ CHECK_PAYMENT_RESPONSE_KEYS = {
     'onchain_execution_started_at', 'onchain_execution_status',
     'onchain_execution_submitted_at', 'onchain_execution_tx_hash', 'payment_status',
     'payment_verification_status', 'percent_for_quorum', 'proposal_status', 'proposal_type',
-    'proposed_by', 'start_at', 'text', 'title', 'version', 'vote_abstain_result',
+    'proposed_by', 'separate_side_quorum', 'start_at', 'text', 'title', 'version', 'vote_abstain_result',
     'vote_against_issuer', 'vote_against_result', 'vote_for_issuer', 'vote_for_result',
 }
 
@@ -426,3 +431,44 @@ class FrontendCompatContractTests(OnChainTestCase):
 
         self.assertEqual(listing.status_code, 200)
         self.assertIn('results', listing.data)
+
+    # -- the quorum rule ---------------------------------------------------
+
+    def test_list_and_detail_report_the_stored_quorum_rule(self):
+        # False is not the model default, so the assertions below can only pass by reading the row.
+        proposal = make_general_proposal(proposal_status=Proposal.VOTED, separate_side_quorum=False)
+
+        listing = self.client.get('/api/proposal/')
+        detail = self.client.get('/api/proposal/{0}/'.format(proposal.id))
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(detail.status_code, 200)
+        results = listing.json()['results']
+        self.assertEqual([row['id'] for row in results], [proposal.id])
+        self.assertIs(results[0]['separate_side_quorum'], False)
+        self.assertIs(detail.json()['separate_side_quorum'], False)
+
+    def test_a_client_body_cannot_set_the_quorum_rule(self):
+        """The create ``POST`` and the edit ``PATCH`` both ignore ``separate_side_quorum``."""
+        envelope_xdr, transaction_hash = self._burn(amount=CREATE_COST, text_html=PROPOSAL_TEXT)
+        created = self.client.post(
+            '/api/proposal/',
+            {**self._v2_create_body(transaction_hash, envelope_xdr), 'separate_side_quorum': False},
+            format='json',
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        proposal = Proposal.objects.get(id=created.data['id'])
+        self.assertEqual(self._confirm(proposal).status_code, 200)
+
+        envelope_xdr, transaction_hash = self._burn(amount=CREATE_COST, text_html=REVISED_TEXT)
+        staged = self.client.patch(
+            '/api/proposal/{0}/'.format(proposal.id),
+            {**self._v2_edit_body(transaction_hash, envelope_xdr), 'separate_side_quorum': False},
+            format='json',
+        )
+        self.assertEqual(staged.status_code, 200, staged.data)
+        self.assertEqual(self._confirm(proposal).status_code, 200)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.title, 'Browser proposal, revised')
+        self.assertIs(proposal.separate_side_quorum, True)
