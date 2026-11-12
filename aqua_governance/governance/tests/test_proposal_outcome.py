@@ -1,8 +1,10 @@
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
+from aqua_governance.governance.models import AssetToken, Proposal
 from aqua_governance.governance.proposal_outcome import (
     ProposalOutcome,
     QuorumSide,
@@ -12,6 +14,8 @@ from aqua_governance.governance.proposal_outcome import (
     get_proposal_outcome,
     get_quorum_votes,
 )
+from aqua_governance.governance.task_logic.proposal_finalization import _execute_onchain_action_if_needed
+from aqua_governance.governance.tests._factories import make_asset_proposal
 
 
 ACCEPTED = ProposalOutcome.ACCEPTED
@@ -33,6 +37,7 @@ REFERENCE_MATRIX = (
     ('M9', '0', '0', '0', '100', NO_QUORUM, NO_QUORUM),
     ('M10', '9.9', '0', '0', '100', NO_QUORUM, NO_QUORUM),
     ('M11', '5', '0', '0', '0', NO_QUORUM, NO_QUORUM),
+    ('M13', '3', '5', '6', '100', REJECTED, REJECTED),
 )
 
 
@@ -118,9 +123,63 @@ class ProposalOutcomeTests(SimpleTestCase):
         self.assertEqual(get_quorum_votes(_proposal('5', '4', '6', True)), Decimal('11'))
         self.assertEqual(get_quorum_votes(_proposal('5', '4', '6', False)), Decimal('15'))
 
+    def test_get_proposal_outcome_without_ice_supply_has_no_quorum(self):
+        for separate_side_quorum in (False, True):
+            with self.subTest(separate_side_quorum=separate_side_quorum):
+                proposal = _proposal('5', '4', '6', separate_side_quorum)
+                proposal.ice_circulating_supply = Decimal('0')
+                self.assertEqual(get_proposal_outcome(proposal), NO_QUORUM)
+
     def test_get_proposal_outcome_rejects_non_simple(self):
         proposal = _proposal('5', '4', '6', True, is_simple_proposal=False)
         with self.assertRaises(ValueError):
             get_proposal_outcome(proposal)
         with self.assertRaises(ValueError):
             get_quorum_votes(proposal)
+
+
+class FinalizationGateTests(TestCase):
+    def _voted_m1_proposal(self, separate_side_quorum):
+        proposal = make_asset_proposal()
+        Proposal.objects.filter(pk=proposal.pk).update(
+            proposal_status=Proposal.VOTED,
+            ice_circulating_supply=Decimal('100'),
+            percent_for_quorum=PERCENT_FOR_QUORUM,
+            vote_for_result=Decimal('9'),
+            vote_against_result=Decimal('1'),
+            vote_abstain_result=Decimal('0.1'),
+            separate_side_quorum=separate_side_quorum,
+        )
+        return proposal
+
+    def _finalize(self, proposal):
+        with patch(
+            'aqua_governance.governance.task_logic.proposal_finalization._enqueue_onchain_send_task',
+        ) as enqueue:
+            _execute_onchain_action_if_needed(proposal, has_fresh_ice_supply=True)
+        proposal.refresh_from_db()
+        return enqueue
+
+    def test_separate_side_quorum_skips_execution_without_side_quorum(self):
+        proposal = self._voted_m1_proposal(separate_side_quorum=True)
+        whitelisted = AssetToken.objects.get(pk=proposal.asset_token_id).whitelisted
+
+        with self.assertLogs(level='INFO') as logs:
+            enqueue = self._finalize(proposal)
+
+        self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_SKIPPED)
+        self.assertEqual(AssetToken.objects.get(pk=proposal.asset_token_id).whitelisted, whitelisted)
+        enqueue.assert_not_called()
+        self.assertIn(
+            f'INFO:root:Skip onchain action for proposal {proposal.id} due to result check. outcome=NO_QUORUM',
+            logs.output,
+        )
+
+    def test_pooled_quorum_executes_as_before(self):
+        proposal = self._voted_m1_proposal(separate_side_quorum=False)
+
+        enqueue = self._finalize(proposal)
+
+        self.assertEqual(proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_PENDING)
+        self.assertTrue(AssetToken.objects.get(pk=proposal.asset_token_id).whitelisted)
+        enqueue.assert_called_once_with(proposal.id)

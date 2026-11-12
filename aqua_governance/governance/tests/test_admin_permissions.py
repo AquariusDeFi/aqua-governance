@@ -308,14 +308,46 @@ class ProposalAdminPermissionTests(TestCase):
 
     def test_admin_quorum_display_requires_positive_ice_supply(self):
         proposal = SimpleNamespace(
+            is_simple_proposal=True,
             vote_for_result=100,
             vote_against_result=0,
             vote_abstain_result=0,
             ice_circulating_supply=0,
             percent_for_quorum=20,
+            separate_side_quorum=True,
         )
 
         self.assertEqual(self.admin._list_display_quorum(proposal), 'Not enough votes')
+
+    def test_admin_quorum_display_names_the_quorum_that_was_met(self):
+        for vote_for, vote_against, separate_side_quorum, expected in (
+            (5, 4, True, 'Enough votes (For quorum 11.00%)'),
+            (4, 5, True, 'Enough votes (Against quorum 11.00%)'),
+            (5, 4, False, 'Enough votes (participation 15.00%)'),
+        ):
+            with self.subTest(vote_for=vote_for, vote_against=vote_against, separate_side_quorum=separate_side_quorum):
+                proposal = SimpleNamespace(
+                    is_simple_proposal=True,
+                    vote_for_result=vote_for,
+                    vote_against_result=vote_against,
+                    vote_abstain_result=6,
+                    ice_circulating_supply=100,
+                    percent_for_quorum=10,
+                    separate_side_quorum=separate_side_quorum,
+                )
+
+                self.assertEqual(self.admin._list_display_quorum(proposal), expected)
+
+    def test_quorum_rule_is_read_only_and_filterable(self):
+        proposal = self._make_proposal(Proposal.PROPOSAL_TYPE_ADD_ASSET)
+        request = self.factory.get('/admin/')
+        request.user = self._create_user(is_superuser=True)
+
+        for obj in (None, proposal):
+            with self.subTest(obj=obj):
+                self.assertIn('separate_side_quorum', self.admin.get_fields(request, obj))
+                self.assertIn('separate_side_quorum', self.admin.get_readonly_fields(request, obj))
+        self.assertIn('separate_side_quorum', self.admin.list_filter)
 
     @patch('aqua_governance.governance.models.requests.get')
     def test_admin_save_model_creates_queue_slot_for_manual_queued_asset_proposal(self, mock_get):

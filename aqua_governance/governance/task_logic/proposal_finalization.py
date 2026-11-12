@@ -7,7 +7,7 @@ from django.db import transaction
 
 from aqua_governance.governance.asset_tokens import apply_asset_proposal_result_to_token
 from aqua_governance.governance.models import LogVote, Proposal
-from aqua_governance.governance.proposal_outcome import as_decimal
+from aqua_governance.governance.proposal_outcome import ProposalOutcome, as_decimal, get_proposal_outcome
 from aqua_governance.governance.vote_eligibility import eligible_votes
 
 
@@ -105,24 +105,6 @@ def _update_ice_circulating_supply(proposal: Proposal) -> bool:
     return True
 
 
-def _has_proposal_quorum(proposal: Proposal) -> bool:
-    total_votes = (
-        as_decimal(proposal.vote_for_result)
-        + as_decimal(proposal.vote_against_result)
-        + as_decimal(proposal.vote_abstain_result)
-    )
-    required_votes = (
-        as_decimal(proposal.ice_circulating_supply)
-        * as_decimal(proposal.percent_for_quorum)
-        / Decimal('100')
-    )
-    return total_votes >= required_votes
-
-
-def _is_proposal_approved(proposal: Proposal) -> bool:
-    return as_decimal(proposal.vote_for_result) > as_decimal(proposal.vote_against_result)
-
-
 def _execute_onchain_action_if_needed(proposal: Proposal, has_fresh_ice_supply: bool) -> None:
     should_enqueue_send_task = False
 
@@ -188,19 +170,17 @@ def _execute_onchain_action_if_needed(proposal: Proposal, has_fresh_ice_supply: 
             # Do NOT change AssetToken.whitelisted on ICE supply failure.
             return
 
-        is_approved = _is_proposal_approved(proposal)
-        has_quorum = _has_proposal_quorum(proposal)
-        if not is_approved or not has_quorum:
+        outcome = get_proposal_outcome(proposal)
+        if outcome != ProposalOutcome.ACCEPTED:
             proposal.onchain_execution_status = Proposal.ONCHAIN_EXECUTION_SKIPPED
             proposal.onchain_execution_tx_hash = None
             proposal.onchain_execution_started_at = None
             proposal.onchain_execution_submitted_at = None
             proposal.onchain_execution_poll_count = 0
             logger.info(
-                'Skip onchain action for proposal %s due to result check. approved=%s quorum=%s',
+                'Skip onchain action for proposal %s due to result check. outcome=%s',
                 proposal.id,
-                is_approved,
-                has_quorum,
+                outcome.value,
             )
             proposal.save(
                 update_fields=[

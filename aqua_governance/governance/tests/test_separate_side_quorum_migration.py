@@ -56,7 +56,11 @@ class SeparateSideQuorumMigrationTests(RestoresMigrationLeaf, TransactionTestCas
     def test_forward_marks_only_completed_proposals_pooled(self):
         # Without an end_at, so the status alone marks it completed.
         voted = self._create_proposal(proposal_status='VOTED')
+        voted_hidden = self._create_proposal(proposal_status='VOTED', hide=True)
         voting_ended = self._create_proposal(proposal_status='VOTING', end_at=FIXED_NOW - timedelta(hours=1))
+        voting_ended_draft = self._create_proposal(
+            proposal_status='VOTING', draft=True, end_at=FIXED_NOW - timedelta(hours=1),
+        )
         voting_ends_now = self._create_proposal(proposal_status='VOTING', end_at=FIXED_NOW)
         voting_open = self._create_proposal(proposal_status='VOTING', end_at=FIXED_NOW + timedelta(hours=1))
         discussion = self._create_proposal(proposal_status='DISCUSSION')
@@ -68,7 +72,9 @@ class SeparateSideQuorumMigrationTests(RestoresMigrationLeaf, TransactionTestCas
 
         expected = {
             voted.id: False,
+            voted_hidden.id: False,
             voting_ended.id: False,
+            voting_ended_draft.id: False,
             voting_ends_now.id: False,
             voting_open.id: True,
             discussion.id: True,
