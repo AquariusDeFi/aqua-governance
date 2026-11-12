@@ -43,7 +43,6 @@ REFERENCE_MATRIX = (
 
 def _proposal(vote_for, vote_against, vote_abstain, separate_side_quorum, is_simple_proposal=True):
     return SimpleNamespace(
-        id=1,
         is_simple_proposal=is_simple_proposal,
         vote_for_result=Decimal(vote_for),
         vote_against_result=Decimal(vote_against),
@@ -130,12 +129,14 @@ class ProposalOutcomeTests(SimpleTestCase):
                 proposal.ice_circulating_supply = Decimal('0')
                 self.assertEqual(get_proposal_outcome(proposal), NO_QUORUM)
 
-    def test_get_proposal_outcome_rejects_non_simple(self):
-        proposal = _proposal('5', '4', '6', True, is_simple_proposal=False)
-        with self.assertRaises(ValueError):
-            get_proposal_outcome(proposal)
-        with self.assertRaises(ValueError):
-            get_quorum_votes(proposal)
+    def test_is_simple_proposal_does_not_change_the_outcome(self):
+        for separate_side_quorum, expected in ((False, ACCEPTED), (True, NO_QUORUM)):
+            with self.subTest(separate_side_quorum=separate_side_quorum):
+                simple = _proposal('9', '1', '0.1', separate_side_quorum)
+                not_simple = _proposal('9', '1', '0.1', separate_side_quorum, is_simple_proposal=False)
+                self.assertEqual(get_proposal_outcome(not_simple), expected)
+                self.assertEqual(get_proposal_outcome(not_simple), get_proposal_outcome(simple))
+                self.assertEqual(get_quorum_votes(not_simple), get_quorum_votes(simple))
 
 
 class FinalizationGateTests(TestCase):

@@ -1,4 +1,4 @@
-"""Outcome of a For/Against/Abstain proposal.
+"""Outcome of a proposal from its For, Against and Abstain vote totals.
 
 The leading side is For when For is strictly greater than Against, otherwise
 Against, so a tie leads to Against.  The quorum votes are counted by one of two
@@ -87,7 +87,6 @@ def compute_outcome(
 
 
 def get_quorum_votes(proposal) -> Decimal:
-    _require_simple_proposal(proposal)
     return compute_quorum_votes(
         proposal.vote_for_result,
         proposal.vote_against_result,
@@ -97,7 +96,6 @@ def get_quorum_votes(proposal) -> Decimal:
 
 
 def get_proposal_outcome(proposal) -> ProposalOutcome:
-    _require_simple_proposal(proposal)
     return compute_outcome(
         proposal.vote_for_result,
         proposal.vote_against_result,
@@ -106,8 +104,3 @@ def get_proposal_outcome(proposal) -> ProposalOutcome:
         proposal.percent_for_quorum,
         proposal.separate_side_quorum,
     )
-
-
-def _require_simple_proposal(proposal) -> None:
-    if not proposal.is_simple_proposal:
-        raise ValueError(f'Proposal {proposal.id} is not a For/Against/Abstain proposal.')

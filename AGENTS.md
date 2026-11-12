@@ -300,7 +300,7 @@ Phase 4 — Bulk DB operations:
 | separate_side_quorum | BooleanField | Default True: side quorum, For+Abstain for For and Against+Abstain for Against (`proposal_outcome.py`). False: pooled For+Against+Abstain quorum, set by migration 0033 on proposals whose voting had ended when it ran. Read-only in the API and admin |
 | hide | BooleanField | Soft delete (excluded from all public endpoints) |
 | draft | BooleanField | True until creation payment verified |
-| is_simple_proposal | BooleanField | Reserved for future custom voting options |
+| is_simple_proposal | BooleanField | Reserved for future custom voting options. Read-only in the admin; the quorum and outcome logic (`proposal_outcome.py`) does not consult it |
 | discord_channel_url/name | URL/CharField | Discussion channel metadata |
 | discord_username | CharField(64) | Submitter's Discord handle |
 

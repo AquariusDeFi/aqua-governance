@@ -308,7 +308,6 @@ class ProposalAdminPermissionTests(TestCase):
 
     def test_admin_quorum_display_requires_positive_ice_supply(self):
         proposal = SimpleNamespace(
-            is_simple_proposal=True,
             vote_for_result=100,
             vote_against_result=0,
             vote_abstain_result=0,
@@ -327,7 +326,6 @@ class ProposalAdminPermissionTests(TestCase):
         ):
             with self.subTest(vote_for=vote_for, vote_against=vote_against, separate_side_quorum=separate_side_quorum):
                 proposal = SimpleNamespace(
-                    is_simple_proposal=True,
                     vote_for_result=vote_for,
                     vote_against_result=vote_against,
                     vote_abstain_result=6,
