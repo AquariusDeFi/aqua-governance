@@ -206,6 +206,66 @@ class AssetProposalConflictTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
 
+    def _post_asset_draft(self, **overrides):
+        with patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE):
+            response = self.client.post('/api/asset-proposal/', self._asset_payload(**overrides), format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        return Proposal.objects.get(id=response.data['id'])
+
+    def test_unpaid_draft_neither_refuses_a_second_post_nor_blocks_its_confirmation(self):
+        self._post_asset_draft(title='First asset proposal', transaction_hash='1' * 64)
+        second = self._post_asset_draft(title='Second asset proposal', transaction_hash='2' * 64)
+
+        with patch(VERIFY_PAYMENT, side_effect=verifies()):
+            result = proposal_transactions.check_transaction(second)
+
+        self.assertEqual(result['outcome'], 'created')
+        second.refresh_from_db()
+        self.assertEqual(second.asset_token_id, self.contract_address)
+
+    @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
+    def test_published_active_proposal_refuses_post_for_classic_and_contract_forms(self, _mock_check_xdr):
+        identifiers = (
+            {'asset_code': DEFAULT_CODE, 'asset_issuer': DEFAULT_ISSUER, 'asset_contract_address': None},
+            {'asset_code': None, 'asset_issuer': None, 'asset_contract_address': self.contract_address},
+        )
+        for blocker_status in (Proposal.QUEUED, Proposal.VOTING):
+            for identifier in identifiers:
+                with self.subTest(status=blocker_status, identifier=identifier):
+                    Proposal.objects.all().delete()
+                    self._create_asset_proposal(transaction_hash='3' * 64, proposal_status=blocker_status)
+                    row_count = Proposal.objects.count()
+
+                    response = self.client.post(
+                        '/api/asset-proposal/',
+                        self._asset_payload(transaction_hash='4' * 64, **identifier),
+                        format='json',
+                    )
+
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn('proposal_id', response.data)
+                    self.assertEqual(Proposal.objects.count(), row_count)
+
+    def test_confirmation_conflict_writes_no_link_for_the_unlinked_loser(self):
+        for index, blocker_status in enumerate((Proposal.QUEUED, Proposal.VOTING), start=5):
+            with self.subTest(status=blocker_status):
+                Proposal.objects.all().delete()
+                loser = self._post_asset_draft(transaction_hash=str(index) * 64)
+                blocker = self._create_asset_proposal(
+                    transaction_hash=str(index + 2) * 64,
+                    proposal_status=blocker_status,
+                )
+
+                with patch(VERIFY_PAYMENT, side_effect=verifies()):
+                    result = proposal_transactions.check_transaction(loser)
+
+                self.assertEqual(result['outcome'], 'asset_proposal_conflict')
+                self.assertEqual(result['conflict']['proposal'], str(blocker.id))
+                loser.refresh_from_db()
+                self.assertIsNone(loser.asset_token_id)
+                self.assertTrue(loser.draft)
+                self.assertEqual(loser.action, Proposal.TO_CREATE)
+
     @patch('aqua_governance.governance.serializers_v2.inspect_envelope', return_value=Proposal.FINE)
     def test_to_submit_and_to_update_asset_proposals_do_not_block_create_while_still_in_discussion(self, _mock_check_xdr):
         for index, action in enumerate((Proposal.TO_SUBMIT, Proposal.TO_UPDATE), start=1):

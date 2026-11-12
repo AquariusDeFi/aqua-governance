@@ -1,4 +1,6 @@
 """API contract regression for /api/asset-tokens/."""
+from decimal import Decimal
+
 from django.conf import settings
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -10,6 +12,7 @@ from aqua_governance.governance.tests._factories import (
     DEFAULT_CODE,
     DEFAULT_ISSUER,
     make_asset_proposal,
+    patch_ice_circulating_supply,
 )
 
 
@@ -25,6 +28,7 @@ EXPECTED_PROPOSAL_KEYS = {
     'id', 'proposal_type', 'proposal_status', 'payment_verification_status', 'title',
     'start_at', 'end_at', 'new_start_at', 'new_end_at',
     'vote_for_result', 'vote_against_result', 'vote_abstain_result',
+    'percent_for_quorum', 'ice_circulating_supply', 'aqua_circulating_supply', 'separate_side_quorum',
     'onchain_execution_status', 'onchain_execution_tx_hash',
     'created_at', 'last_updated_at',
 }
@@ -64,6 +68,27 @@ class AssetTokensApiContractTests(TestCase):
         # The queryset serves published proposals only, so cards here always carry
         # the raw payment status; the PENDING collapse is covered separately below.
         self.assertEqual(token_card['proposals'][0]['payment_verification_status'], Proposal.BAD_MEMO)
+
+    def test_proposal_quorum_fields_keep_their_json_types(self):
+        proposal = make_asset_proposal(title='Pooled ADD')
+        # Seven-decimal supplies that a binary float cannot represent exactly.
+        Proposal.objects.filter(pk=proposal.pk).update(
+            separate_side_quorum=False,
+            ice_circulating_supply=Decimal('44413619459.0892075'),
+            aqua_circulating_supply=Decimal('12345678901.2345678'),
+            percent_for_quorum=10,
+        )
+
+        response = self.client.get('/api/asset-tokens/')
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()['results'][0]['proposals'][0]
+        self.assertEqual(item['id'], proposal.id)
+        self.assertIs(item['separate_side_quorum'], False)
+        self.assertEqual(item['ice_circulating_supply'], '44413619459.0892075')
+        self.assertEqual(item['aqua_circulating_supply'], '12345678901.2345678')
+        self.assertIs(type(item['percent_for_quorum']), int)
+        self.assertEqual(item['percent_for_quorum'], 10)
 
     def test_draft_awaiting_verification_serializes_as_pending(self):
         """`Proposal.payment_verification_status` masks the payment status of a
@@ -146,3 +171,46 @@ class AssetTokensApiContractTests(TestCase):
         body = response.json()
         self.assertEqual(body['count'], 0)
         self.assertEqual(body['results'], [])
+
+
+class AssetTokensWhitelistedFilterTests(TestCase):
+    def setUp(self):
+        ice_supply_patcher = patch_ice_circulating_supply()
+        ice_supply_patcher.start()
+        self.addCleanup(ice_supply_patcher.stop)
+        self.client = APIClient()
+
+        make_asset_proposal(title='Whitelisted token', asset_code=DEFAULT_CODE)
+        make_asset_proposal(title='Other token', asset_code='OTHER')
+        self.whitelisted = Asset(DEFAULT_CODE, DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE)
+        self.not_whitelisted = Asset('OTHER', DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE)
+        AssetToken.objects.filter(contract_address=self.whitelisted).update(whitelisted=True)
+
+    def _assert_listed(self, query_string, expected_addresses):
+        response = self.client.get(f'/api/asset-tokens/{query_string}')
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['count'], len(expected_addresses))
+        self.assertCountEqual(
+            [row['asset_contract_address'] for row in body['results']],
+            expected_addresses,
+        )
+
+    def test_true_returns_only_whitelisted_tokens(self):
+        self._assert_listed('?whitelisted=true', [self.whitelisted])
+
+    def test_false_returns_only_non_whitelisted_tokens(self):
+        self._assert_listed('?whitelisted=false', [self.not_whitelisted])
+
+    def test_value_is_case_insensitive_and_trimmed(self):
+        self._assert_listed('?whitelisted=TRUE', [self.whitelisted])
+        self._assert_listed('?whitelisted=%20False%20', [self.not_whitelisted])
+
+    def test_missing_parameter_returns_every_token(self):
+        self._assert_listed('', [self.whitelisted, self.not_whitelisted])
+
+    def test_unknown_value_returns_every_token(self):
+        for value in ('maybe', '1', ''):
+            with self.subTest(value=value):
+                self._assert_listed(f'?whitelisted={value}', [self.whitelisted, self.not_whitelisted])

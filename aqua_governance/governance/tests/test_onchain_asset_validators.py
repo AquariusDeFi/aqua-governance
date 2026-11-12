@@ -3,7 +3,14 @@ from django.test import SimpleTestCase, override_settings
 from stellar_sdk import Asset
 
 from aqua_governance.governance.asset_payload import validate_asset_payload
+from aqua_governance.governance.asset_tokens import derive_asset_contract_address
 from aqua_governance.governance.tests._factories import DEFAULT_ISSUER
+
+
+VALID_CONTRACT_ADDRESS = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM'
+ACCOUNT_ADDRESS = 'GCZ3PVJTKLUB724VUS2ZZZCG3NAYBS75BMBJ6RG3OLPXKC23ISKWLZTI'
+MALFORMED_CONTRACT_ADDRESSES = ('not-a-contract', 'C' + 'A' * 55)
+INVALID_CONTRACT_ADDRESS_ERROR = r'asset_contract_address must be a valid Soroban contract address\.'
 
 
 @override_settings(NETWORK_PASSPHRASE='Test SDF Network ; September 2015')
@@ -81,4 +88,104 @@ class ValidateAssetPayloadTests(SimpleTestCase):
                 asset_issuer=DEFAULT_ISSUER,
                 asset_contract_address=wrong_contract_address,
                 require_onchain_verification=True,
+            )
+
+    def test_rejects_account_address_as_contract_address(self):
+        with self.assertRaisesRegex(ValueError, INVALID_CONTRACT_ADDRESS_ERROR):
+            validate_asset_payload(
+                asset_code=None,
+                asset_issuer=None,
+                asset_contract_address=ACCOUNT_ADDRESS,
+                require_onchain_verification=True,
+            )
+
+    def test_rejects_account_address_next_to_classic_pair(self):
+        with self.assertRaisesRegex(ValueError, INVALID_CONTRACT_ADDRESS_ERROR):
+            validate_asset_payload(
+                asset_code='AQUA',
+                asset_issuer=DEFAULT_ISSUER,
+                asset_contract_address=ACCOUNT_ADDRESS,
+                require_onchain_verification=True,
+            )
+
+    def test_rejects_malformed_contract_address(self):
+        for value in MALFORMED_CONTRACT_ADDRESSES:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, INVALID_CONTRACT_ADDRESS_ERROR):
+                    validate_asset_payload(
+                        asset_code=None,
+                        asset_issuer=None,
+                        asset_contract_address=value,
+                        require_onchain_verification=True,
+                    )
+
+
+@override_settings(NETWORK_PASSPHRASE='Test SDF Network ; September 2015')
+class DeriveAssetContractAddressTests(SimpleTestCase):
+    def test_returns_valid_contract_address(self):
+        self.assertEqual(
+            derive_asset_contract_address(
+                asset_code=None,
+                asset_issuer=None,
+                asset_contract_address=VALID_CONTRACT_ADDRESS,
+            ),
+            VALID_CONTRACT_ADDRESS,
+        )
+
+    def test_strips_valid_contract_address(self):
+        self.assertEqual(
+            derive_asset_contract_address(
+                asset_code=None,
+                asset_issuer=None,
+                asset_contract_address=f'  {VALID_CONTRACT_ADDRESS} ',
+            ),
+            VALID_CONTRACT_ADDRESS,
+        )
+
+    def test_rejects_account_address(self):
+        with self.assertRaisesRegex(ValueError, INVALID_CONTRACT_ADDRESS_ERROR):
+            derive_asset_contract_address(
+                asset_code=None,
+                asset_issuer=None,
+                asset_contract_address=ACCOUNT_ADDRESS,
+            )
+
+    def test_rejects_malformed_contract_address(self):
+        for value in MALFORMED_CONTRACT_ADDRESSES:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, INVALID_CONTRACT_ADDRESS_ERROR):
+                    derive_asset_contract_address(
+                        asset_code=None,
+                        asset_issuer=None,
+                        asset_contract_address=value,
+                    )
+
+    def test_derives_contract_address_from_classic_pair(self):
+        self.assertEqual(
+            derive_asset_contract_address(
+                asset_code='AQUA',
+                asset_issuer=DEFAULT_ISSUER,
+                asset_contract_address=None,
+            ),
+            Asset('AQUA', DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE),
+        )
+
+    def test_accepts_matching_contract_address_next_to_classic_pair(self):
+        expected = Asset('AQUA', DEFAULT_ISSUER).contract_id(settings.NETWORK_PASSPHRASE)
+
+        self.assertEqual(
+            derive_asset_contract_address(
+                asset_code='AQUA',
+                asset_issuer=DEFAULT_ISSUER,
+                asset_contract_address=expected,
+            ),
+            expected,
+        )
+
+    def test_rejects_contract_address_that_differs_from_classic_pair(self):
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            derive_asset_contract_address(
+                asset_code='AQUA',
+                asset_issuer=DEFAULT_ISSUER,
+                asset_contract_address=VALID_CONTRACT_ADDRESS,
             )

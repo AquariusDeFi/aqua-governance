@@ -331,7 +331,12 @@ class ProposalAdminForm(forms.ModelForm):
                 require_onchain_verification=False,
             )
         except ValueError as exc:
-            raise ValidationError(self._map_asset_validation_error(str(exc))) from exc
+            field_errors = self._map_asset_validation_error(str(exc))
+            # The asset fields are read-only on the change form, and an error
+            # keyed by a field the form does not have raises from add_error.
+            if any(field_name not in self.fields for field_name in field_errors):
+                raise ValidationError(str(exc)) from exc
+            raise ValidationError(field_errors) from exc
 
     def _cleaned_or_instance_value(self, cleaned_data, field_name):
         if field_name in cleaned_data:

@@ -8,6 +8,7 @@ from django.db.models import Q
 from django.utils import timezone
 from stellar_sdk import Asset
 
+from aqua_governance.governance.asset_payload import ensure_contract_address
 from aqua_governance.governance.models import AssetToken, Proposal
 
 
@@ -43,7 +44,9 @@ def derive_asset_contract_address(*, asset_code, asset_issuer, asset_contract_ad
       they match.
     * If only the classic pair is provided, derive and return the contract
       address.
-    * If only the contract address is provided, return it as-is.
+    * If only the contract address is provided, return it.
+    * An explicit address that is not a valid Soroban contract address raises
+      ``ValueError``.
     * If neither is provided, raise ``ValueError``.
     """
     normalized_code = normalize_asset_value(asset_code)
@@ -63,6 +66,7 @@ def derive_asset_contract_address(*, asset_code, asset_issuer, asset_contract_ad
         )
 
     if has_contract:
+        ensure_contract_address(normalized_contract)
         if derived and derived != normalized_contract:
             raise ValueError(
                 "asset_contract_address does not match asset_code + asset_issuer."
@@ -177,11 +181,15 @@ def validate_asset_token_consistency(proposal):
     asset_issuer = normalize_asset_value(proposal.asset_issuer)
     existing_contract_address = normalize_asset_value(proposal.asset_contract_address)
 
-    derived_contract_address = derive_asset_contract_address(
-        asset_code=asset_code,
-        asset_issuer=asset_issuer,
-        asset_contract_address=existing_contract_address,
-    )
+    try:
+        derived_contract_address = derive_asset_contract_address(
+            asset_code=asset_code,
+            asset_issuer=asset_issuer,
+            asset_contract_address=existing_contract_address,
+        )
+    except ValueError as exc:
+        # Non-field: the asset fields are read-only on the admin change form.
+        raise ValidationError(str(exc)) from exc
 
     if proposal.asset_token_id != derived_contract_address:
         raise ValidationError({

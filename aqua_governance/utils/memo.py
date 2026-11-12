@@ -148,9 +148,9 @@ def _literal_element(value, field_name):
 def create_memo_payload(*, proposed_by, proposal_type, title, text_html) -> str:
     """CREATE preimage.
 
-    Carries no asset fields by design: ``upsert_asset_token_from_proposal`` normalises the
-    code and issuer and writes back a derived contract address, so a memo over the asset
-    triple could never be reproduced at promotion time for a classic pair.  ``proposal_type``
+    Carries no asset fields by design: creating an asset proposal stores a contract address
+    derived from the code and issuer, so a memo over the asset triple could never be
+    reproduced at promotion time for a classic pair.  ``proposal_type``
     is client-supplied, validated against a closed set and never rewritten, and it alone
     carries the purpose separation the asset triple was justified by.
     """

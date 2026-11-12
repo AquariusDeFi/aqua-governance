@@ -26,6 +26,11 @@ def normalize_asset_addresses(args: list[str]) -> list[str]:
     return normalized_assets
 
 
+def ensure_contract_address(value: str) -> None:
+    if not StrKey.is_valid_contract(value):
+        raise ValueError('asset_contract_address must be a valid Soroban contract address.')
+
+
 def validate_asset_payload(
     *,
     asset_code,
@@ -66,8 +71,7 @@ def validate_asset_payload(
         derived_addresses.append(derived_contract_address)
 
     if has_contract_asset:
-        normalized_addresses = normalize_asset_addresses([normalized_contract_address])
-        normalized_contract_address = normalized_addresses[0]
+        ensure_contract_address(normalized_contract_address)
 
         if derived_contract_address and derived_contract_address != normalized_contract_address:
             raise ValueError('asset_contract_address does not match asset_code + asset_issuer.')

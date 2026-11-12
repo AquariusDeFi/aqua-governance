@@ -6,9 +6,10 @@ from rest_framework.validators import UniqueValidator
 
 from aqua_governance.governance.asset_payload import validate_asset_payload
 from aqua_governance.governance.asset_tokens import (
+    derive_asset_contract_address,
     find_active_asset_proposal_conflict,
+    normalize_asset_value,
     serialize_asset_proposal_conflict,
-    upsert_asset_token_from_proposal,
 )
 from aqua_governance.governance.db_locks import acquire_proposal_transition_lock
 from aqua_governance.governance.exceptions import AssetProposalConflictError, ASSET_PROPOSAL_CONFLICT_DETAIL
@@ -231,6 +232,7 @@ class ProposalListSerializer(serializers.ModelSerializer):
             "logvote_set",
             "percent_for_quorum",
             "ice_circulating_supply",
+            "separate_side_quorum",
             "vote_for_issuer",
             "vote_against_issuer",
             "abstain_issuer",
@@ -257,6 +259,9 @@ class ProposalListSerializer(serializers.ModelSerializer):
             "asset_community_references",
             "asset_aquarius_traction",
             "asset_issuer_commitments",
+        ]
+        read_only_fields = [
+            "separate_side_quorum",
         ]
 
     def get_payment_verification_status(self, obj):
@@ -295,6 +300,7 @@ class ProposalDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "percent_for_quorum",
             "ice_circulating_supply",
+            "separate_side_quorum",
             "abstain_issuer",
             "vote_abstain_result",
             "proposal_type",
@@ -319,6 +325,9 @@ class ProposalDetailSerializer(serializers.ModelSerializer):
             "asset_community_references",
             "asset_aquarius_traction",
             "asset_issuer_commitments",
+        ]
+        read_only_fields = [
+            "separate_side_quorum",
         ]
 
     def get_payment_verification_status(self, obj):
@@ -570,11 +579,15 @@ class AssetProposalCreateSerializer(serializers.ModelSerializer):
         )
         validated_data["payment_status"] = status
 
-        with transaction.atomic():
-            proposal = super().create(validated_data)
-            upsert_asset_token_from_proposal(proposal, save=True)
+        # Set before the insert: the address is immutable once the row exists.
+        if not normalize_asset_value(validated_data.get("asset_contract_address")):
+            validated_data["asset_contract_address"] = derive_asset_contract_address(
+                asset_code=validated_data.get("asset_code"),
+                asset_issuer=validated_data.get("asset_issuer"),
+                asset_contract_address=None,
+            )
 
-        return proposal
+        return super().create(validated_data)
 
 
 # ---------------------------------------------------------------------------
@@ -869,10 +882,20 @@ class AssetTokenProposalSerializer(serializers.ModelSerializer):
             "vote_for_result",
             "vote_against_result",
             "vote_abstain_result",
+            "percent_for_quorum",
+            "ice_circulating_supply",
+            "aqua_circulating_supply",
+            "separate_side_quorum",
             "onchain_execution_status",
             "onchain_execution_tx_hash",
             "created_at",
             "last_updated_at",
+        ]
+        read_only_fields = [
+            "percent_for_quorum",
+            "ice_circulating_supply",
+            "aqua_circulating_supply",
+            "separate_side_quorum",
         ]
 
     def get_payment_verification_status(self, obj):
