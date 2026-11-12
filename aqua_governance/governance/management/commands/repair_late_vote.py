@@ -10,6 +10,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from aqua_governance.governance.models import AssetToken, LogVote, Proposal
+from aqua_governance.governance.proposal_outcome import ProposalOutcome, compute_outcome, compute_quorum_votes
 
 
 PROPOSAL_FIELDS = (
@@ -194,8 +195,12 @@ class Command(BaseCommand):
         total_votes = sum(totals.values())
         required_votes = supply * proposal.percent_for_quorum / Decimal('100')
         majority_for = totals['vote_for_result'] > totals['vote_against_result']
-        quorum_met = total_votes >= required_votes
+        tallies = (totals['vote_for_result'], totals['vote_against_result'], totals['vote_abstain_result'])
+        separate_side_quorum = proposal.separate_side_quorum
+        outcome = compute_outcome(*tallies, supply, proposal.percent_for_quorum, separate_side_quorum)
         return {
             'majority_for': majority_for, 'total_votes': total_votes, 'required_votes': required_votes,
-            'quorum_met': quorum_met, 'approved': majority_for and quorum_met,
+            'quorum_met': outcome != ProposalOutcome.NO_QUORUM, 'approved': outcome == ProposalOutcome.ACCEPTED,
+            'quorum_votes': compute_quorum_votes(*tallies, separate_side_quorum),
+            'separate_side_quorum': separate_side_quorum,
         }

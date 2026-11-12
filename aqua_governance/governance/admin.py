@@ -17,7 +17,24 @@ from aqua_governance.governance.models import (
     Proposal,
     ProposalQueueSlot,
 )
+from aqua_governance.governance.proposal_outcome import (
+    ProposalOutcome,
+    QuorumSide,
+    as_decimal,
+    compute_quorum_side,
+    get_proposal_outcome,
+    get_quorum_votes,
+)
 from aqua_governance.governance.proposal_queue_slots import sync_proposal_queue_slot
+
+
+# Keyed by compute_quorum_side: quorum counts the leading side plus Abstain under the
+# separate side rule and all votes (None) under the pooled rule.
+QUORUM_LABELS = {
+    QuorumSide.FOR: 'For quorum',
+    QuorumSide.AGAINST: 'Against quorum',
+    None: 'participation',
+}
 
 
 @admin.register(Proposal)
@@ -32,10 +49,10 @@ class ProposalAdmin(admin.ModelAdmin):
     readonly_fields = [
         'vote_for_issuer', 'vote_against_issuer', 'abstain_issuer', 'version',
         'created_at', 'last_updated_at',
-        'draft', 'status', 'action',
+        'is_simple_proposal', 'draft', 'status', 'action',
         'proposal_status', 'payment_status',
         'vote_for_result', 'vote_against_result', 'vote_abstain_result',
-        'aqua_circulating_supply', 'ice_circulating_supply', 'percent_for_quorum',
+        'aqua_circulating_supply', 'ice_circulating_supply', 'percent_for_quorum', 'separate_side_quorum',
         'onchain_action_type', 'onchain_action_args',
         'onchain_execution_status', 'onchain_execution_tx_hash',
         'onchain_execution_started_at', 'onchain_execution_submitted_at', 'onchain_execution_poll_count',
@@ -51,7 +68,7 @@ class ProposalAdmin(admin.ModelAdmin):
         'new_title', 'new_text', 'new_transaction_hash', 'new_envelope_xdr', 'new_start_at', 'new_end_at',
         'vote_for_issuer', 'vote_against_issuer', 'abstain_issuer',
         'vote_for_result', 'vote_against_result', 'vote_abstain_result',
-        'aqua_circulating_supply', 'ice_circulating_supply', 'percent_for_quorum',
+        'aqua_circulating_supply', 'ice_circulating_supply', 'percent_for_quorum', 'separate_side_quorum',
         'discord_channel_url', 'discord_channel_name', 'discord_username',
         'asset_code', 'asset_issuer', 'asset_contract_address', 'asset_issuer_information',
         'asset_token_description', 'asset_holder_distribution', 'asset_liquidity', 'asset_trading_volume',
@@ -60,7 +77,10 @@ class ProposalAdmin(admin.ModelAdmin):
         'onchain_action_type', 'onchain_action_args', 'onchain_execution_status', 'onchain_execution_tx_hash',
         'onchain_execution_started_at', 'onchain_execution_submitted_at', 'onchain_execution_poll_count',
     ]
-    list_filter = ('proposal_type', 'proposal_status', 'payment_status', 'draft', 'hide', 'action', 'start_at', 'end_at')
+    list_filter = (
+        'proposal_type', 'proposal_status', 'payment_status', 'draft', 'hide', 'action', 'start_at', 'end_at',
+        'separate_side_quorum',
+    )
     form = ProposalAdminForm
 
     class Media:
@@ -179,12 +199,12 @@ class ProposalAdmin(admin.ModelAdmin):
         return bool({'proposal_status', 'start_at', 'end_at'} & set(form.changed_data))
 
     def _list_display_quorum(self, obj):
-        if not obj.ice_circulating_supply or float(obj.ice_circulating_supply) <= 0:
+        if get_proposal_outcome(obj) == ProposalOutcome.NO_QUORUM:
             return 'Not enough votes'
-        if obj.vote_for_result + obj.vote_against_result + obj.vote_abstain_result >= (
-            float(obj.ice_circulating_supply)) * obj.percent_for_quorum / 100:
-            return 'Enough votes'
-        return 'Not enough votes'
+        quorum_side = compute_quorum_side(obj.vote_for_result, obj.vote_against_result, obj.separate_side_quorum)
+        # Quorum is met, so the supply is positive.
+        percent = get_quorum_votes(obj) / as_decimal(obj.ice_circulating_supply) * 100
+        return f'Enough votes ({QUORUM_LABELS[quorum_side]} {percent:.2f}%)'
 
     _list_display_quorum.short_description = 'quorum'
 

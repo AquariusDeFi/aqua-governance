@@ -23,7 +23,7 @@ class RepairLateVoteTests(TestCase):
             proposal_status=Proposal.VOTED, end_at=self.end,
             onchain_execution_status=Proposal.ONCHAIN_EXECUTION_SKIPPED,
             vote_for_result=100, vote_against_result=101, vote_abstain_result=7,
-            ice_circulating_supply=500,
+            ice_circulating_supply=500, separate_side_quorum=False,
         )
         self.proposal.refresh_from_db()
         self.vote('for', LogVote.VOTE_FOR, voted_amount=100, amount=50, claimed=True)
@@ -62,7 +62,7 @@ class RepairLateVoteTests(TestCase):
         self.assertEqual(first['totals']['vote_against_result'], '90.0000000')
         self.assertEqual(first['decision'], {
             'majority_for': True, 'total_votes': '197.0000000', 'required_votes': '100.0000000',
-            'quorum_met': True, 'approved': True,
+            'quorum_met': True, 'approved': True, 'quorum_votes': '197.0000000', 'separate_side_quorum': False,
         })
         self.proposal.refresh_from_db()
         self.assertEqual(self.proposal.onchain_execution_status, Proposal.ONCHAIN_EXECUTION_SKIPPED)
@@ -191,6 +191,29 @@ class RepairLateVoteTests(TestCase):
         decision = self.command()['decision']
         self.assertEqual(decision['total_votes'], '200.0000000')
         self.assertTrue(decision['approved'])
+
+    def test_decision_follows_side_quorum(self):
+        Proposal.objects.filter(pk=self.proposal.pk).update(ice_circulating_supply=1000)
+        LogVote.objects.filter(claimable_balance_id='abstain').update(voted_amount=10)
+        self.assertTrue(self.command()['decision']['approved'])
+
+        Proposal.objects.filter(pk=self.proposal.pk).update(separate_side_quorum=True)
+        decision = self.command()['decision']
+        self.assertTrue(decision['majority_for'])
+        self.assertEqual(decision['total_votes'], '200.0000000')
+        self.assertEqual(decision['quorum_votes'], '110.0000000')
+        self.assertFalse(decision['quorum_met'])
+        self.assertFalse(decision['approved'])
+        self.assertTrue(decision['separate_side_quorum'])
+
+    def test_zero_supply_never_meets_quorum(self):
+        Proposal.objects.filter(pk=self.proposal.pk).update(ice_circulating_supply=0)
+        for separate_side_quorum in (False, True):
+            with self.subTest(separate_side_quorum=separate_side_quorum):
+                Proposal.objects.filter(pk=self.proposal.pk).update(separate_side_quorum=separate_side_quorum)
+                decision = self.command()['decision']
+                self.assertFalse(decision['quorum_met'])
+                self.assertFalse(decision['approved'])
 
     def test_atomic_rollback_when_token_update_fails(self):
         digest = self.snapshot()
