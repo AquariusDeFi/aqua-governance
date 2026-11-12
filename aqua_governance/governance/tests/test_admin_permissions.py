@@ -338,15 +338,19 @@ class ProposalAdminPermissionTests(TestCase):
 
                 self.assertEqual(self.admin._list_display_quorum(proposal), expected)
 
-    def test_quorum_rule_is_read_only_and_filterable(self):
+    def test_quorum_rule_fields_are_read_only_for_every_admin_role(self):
         proposal = self._make_proposal(Proposal.PROPOSAL_TYPE_ADD_ASSET)
-        request = self.factory.get('/admin/')
-        request.user = self._create_user(is_superuser=True)
 
-        for obj in (None, proposal):
-            with self.subTest(obj=obj):
-                self.assertIn('separate_side_quorum', self.admin.get_fields(request, obj))
-                self.assertIn('separate_side_quorum', self.admin.get_readonly_fields(request, obj))
+        for user in (self._create_user(is_superuser=True), self._create_user(with_manage_perm=True)):
+            request = self.factory.get('/admin/')
+            request.user = user
+            for obj in (None, proposal):
+                form = self.admin.get_form(request, obj=obj, change=obj is not None)(instance=obj)
+                for field in ('is_simple_proposal', 'separate_side_quorum'):
+                    with self.subTest(superuser=user.is_superuser, obj=obj, field=field):
+                        self.assertIn(field, self.admin.get_fields(request, obj))
+                        self.assertIn(field, self.admin.get_readonly_fields(request, obj))
+                        self.assertNotIn(field, form.fields)
         self.assertIn('separate_side_quorum', self.admin.list_filter)
 
     @patch('aqua_governance.governance.models.requests.get')

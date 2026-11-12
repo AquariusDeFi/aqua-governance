@@ -49,7 +49,7 @@ class ProposalAdmin(admin.ModelAdmin):
     readonly_fields = [
         'vote_for_issuer', 'vote_against_issuer', 'abstain_issuer', 'version',
         'created_at', 'last_updated_at',
-        'draft', 'status', 'action',
+        'is_simple_proposal', 'draft', 'status', 'action',
         'proposal_status', 'payment_status',
         'vote_for_result', 'vote_against_result', 'vote_abstain_result',
         'aqua_circulating_supply', 'ice_circulating_supply', 'percent_for_quorum', 'separate_side_quorum',
