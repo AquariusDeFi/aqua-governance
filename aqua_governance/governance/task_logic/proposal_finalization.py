@@ -1,6 +1,5 @@
 import logging
 from decimal import Decimal
-from typing import Any
 
 import requests
 from django.conf import settings
@@ -8,6 +7,7 @@ from django.db import transaction
 
 from aqua_governance.governance.asset_tokens import apply_asset_proposal_result_to_token
 from aqua_governance.governance.models import LogVote, Proposal
+from aqua_governance.governance.proposal_outcome import as_decimal
 from aqua_governance.governance.vote_eligibility import eligible_votes
 
 
@@ -42,7 +42,7 @@ def _sum_votes_for_proposal(proposal: Proposal, vote_choice: str) -> Decimal:
             (voted_amount if voted_amount is not None else amount)
             for voted_amount, amount in rows
         )
-        return _as_decimal(total)
+        return as_decimal(total)
 
     amounts = votes.filter(
         vote_choice=vote_choice,
@@ -50,7 +50,7 @@ def _sum_votes_for_proposal(proposal: Proposal, vote_choice: str) -> Decimal:
         claimed=False,
         asset_code__in=supported_vote_assets,
     ).values_list('amount', flat=True)
-    return _as_decimal(sum(amounts))
+    return as_decimal(sum(amounts))
 
 
 def update_proposal_final_results(proposal_id: int) -> None:
@@ -105,30 +105,22 @@ def _update_ice_circulating_supply(proposal: Proposal) -> bool:
     return True
 
 
-def _as_decimal(value: Any) -> Decimal:
-    if value is None:
-        return Decimal('0')
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
-
-
 def _has_proposal_quorum(proposal: Proposal) -> bool:
     total_votes = (
-        _as_decimal(proposal.vote_for_result)
-        + _as_decimal(proposal.vote_against_result)
-        + _as_decimal(proposal.vote_abstain_result)
+        as_decimal(proposal.vote_for_result)
+        + as_decimal(proposal.vote_against_result)
+        + as_decimal(proposal.vote_abstain_result)
     )
     required_votes = (
-        _as_decimal(proposal.ice_circulating_supply)
-        * _as_decimal(proposal.percent_for_quorum)
+        as_decimal(proposal.ice_circulating_supply)
+        * as_decimal(proposal.percent_for_quorum)
         / Decimal('100')
     )
     return total_votes >= required_votes
 
 
 def _is_proposal_approved(proposal: Proposal) -> bool:
-    return _as_decimal(proposal.vote_for_result) > _as_decimal(proposal.vote_against_result)
+    return as_decimal(proposal.vote_for_result) > as_decimal(proposal.vote_against_result)
 
 
 def _execute_onchain_action_if_needed(proposal: Proposal, has_fresh_ice_supply: bool) -> None:
