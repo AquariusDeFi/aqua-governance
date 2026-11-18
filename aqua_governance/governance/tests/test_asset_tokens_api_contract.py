@@ -1,4 +1,6 @@
 """API contract regression for /api/asset-tokens/."""
+from decimal import Decimal
+
 from django.conf import settings
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -26,6 +28,7 @@ EXPECTED_PROPOSAL_KEYS = {
     'id', 'proposal_type', 'proposal_status', 'payment_verification_status', 'title',
     'start_at', 'end_at', 'new_start_at', 'new_end_at',
     'vote_for_result', 'vote_against_result', 'vote_abstain_result',
+    'percent_for_quorum', 'ice_circulating_supply', 'aqua_circulating_supply', 'separate_side_quorum',
     'onchain_execution_status', 'onchain_execution_tx_hash',
     'created_at', 'last_updated_at',
 }
@@ -65,6 +68,27 @@ class AssetTokensApiContractTests(TestCase):
         # The queryset serves published proposals only, so cards here always carry
         # the raw payment status; the PENDING collapse is covered separately below.
         self.assertEqual(token_card['proposals'][0]['payment_verification_status'], Proposal.BAD_MEMO)
+
+    def test_proposal_quorum_fields_keep_their_json_types(self):
+        proposal = make_asset_proposal(title='Pooled ADD')
+        # Seven-decimal supplies that a binary float cannot represent exactly.
+        Proposal.objects.filter(pk=proposal.pk).update(
+            separate_side_quorum=False,
+            ice_circulating_supply=Decimal('44413619459.0892075'),
+            aqua_circulating_supply=Decimal('12345678901.2345678'),
+            percent_for_quorum=10,
+        )
+
+        response = self.client.get('/api/asset-tokens/')
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()['results'][0]['proposals'][0]
+        self.assertEqual(item['id'], proposal.id)
+        self.assertIs(item['separate_side_quorum'], False)
+        self.assertEqual(item['ice_circulating_supply'], '44413619459.0892075')
+        self.assertEqual(item['aqua_circulating_supply'], '12345678901.2345678')
+        self.assertIs(type(item['percent_for_quorum']), int)
+        self.assertEqual(item['percent_for_quorum'], 10)
 
     def test_draft_awaiting_verification_serializes_as_pending(self):
         """`Proposal.payment_verification_status` masks the payment status of a
